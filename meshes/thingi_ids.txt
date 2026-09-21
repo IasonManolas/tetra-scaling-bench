@@ -1,0 +1,115 @@
+# Thingi10K model IDs making up the measurement set.
+#
+# These are the 100 curated solid models used by this project's Linux
+# measurement campaign (~/tetra_opt/thingi10k/selected_100_mesh), which are the
+# subset of Thingi10K's "fixed"/autorefined release that CGAL's own
+# Constrained_triangulation_3 test list marks solid with under 10k vertices
+# (thingi10k_max_10k_solid.cmake), further filtered to those that build a CDT
+# cleanly. The 12 models of the acceptance set (1146193, 409635, 314590, 65617,
+# 51492, 124534, 360073, 65619, 495000, 118287, 102041, 36082) are all already
+# in this list -- there is one pipeline, not two.
+#
+# Only the .off inputs are distributed (~18 MB); prepare_meshes.py builds the
+# .mesh files locally (~720 MB), which is why regenerating beats shipping them.
+#
+# One id per line. Blank lines and #-comments are ignored.
+36082
+40984
+40988
+41104
+42652
+48224
+48421
+49544
+50112
+51009
+51492
+65607
+65609
+65617
+65619
+67550
+67856
+67990
+68248
+94147
+94157
+94662
+94665
+94731
+94733
+95476
+95487
+95489
+95663
+96046
+96073
+96781
+99904
+100323
+100638
+100894
+101341
+101556
+102041
+102255
+102294
+103086
+103211
+108858
+110905
+112544
+112925
+113000
+113221
+113344
+113891
+116063
+118287
+118299
+118909
+124534
+129988
+130030
+131723
+132447
+135214
+186202
+186541
+203281
+263199
+289662
+289668
+313917
+314590
+319831
+332810
+343529
+343544
+343546
+360072
+360073
+409635
+482910
+495000
+497513
+500093
+500107
+509312
+591235
+985159
+1018275
+1036311
+1036396
+1036400
+1036650
+1095207
+1120766
+1146193
+1148096
+1224384
+1307397
+1439534
+1458696
+1489599
+1582421

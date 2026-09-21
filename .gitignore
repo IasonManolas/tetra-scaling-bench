@@ -1,0 +1,8 @@
+work/
+out_meshes/
+results/
+report/
+*.pyc
+__pycache__/
+*.mesh
+!driver/*.mesh
