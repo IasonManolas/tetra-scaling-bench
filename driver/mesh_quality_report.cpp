@@ -54,7 +54,13 @@ int main(int argc, char** argv)
   C3t3 c3t3;
   T3& tr = c3t3.triangulation();
   std::ifstream is(input, std::ios_base::in);
-  if(!CGAL::IO::read_MEDIT(is, tr))
+  // allow_non_manifold is required, not defensive. read_MEDIT refuses a
+  // non-manifold triangulation by default, and remeshing a Mesh_3-derived
+  // input produces outputs that trip it: measured here, every Mesh_3 output
+  // failed to read while every CDT output of the same run read fine. Refusing
+  // them would silently drop one of the two input pipelines from the quality
+  // half of the report -- the half the pipeline comparison depends on.
+  if(!CGAL::IO::read_MEDIT(is, tr, CGAL::parameters::allow_non_manifold(true)))
     fatal_error(std::string("Could not read input mesh '") + input + "'");
 
   // the metrics are computed over the cells of the complex, so restricting to

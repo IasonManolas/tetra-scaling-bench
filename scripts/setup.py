@@ -158,7 +158,8 @@ def main():
         main_tree = root / "cgal-main"
         main_sha = clone_or_update(MAIN_URL, MAIN_REF, main_tree, args.offline)
 
-    print("\n[build] ours arm (bench_remesh, preprocess_cdt, mesh_quality_report)")
+    print("\n[build] ours arm (bench_remesh, preprocess_cdt, preprocess_mesh3, "
+          "mesh_quality_report)")
     cmake_build("ours", ours, root / "build_ours", args.tbb_dir, args.jobs, args.fresh)
 
     print("\n[build] main arm (bench_remesh_main)")
@@ -167,6 +168,7 @@ def main():
     bins = {
         "bench_remesh":        root / "build_ours" / "bench_remesh",
         "preprocess_cdt":      root / "build_ours" / "preprocess_cdt",
+        "preprocess_mesh3":    root / "build_ours" / "preprocess_mesh3",
         "mesh_quality_report": root / "build_ours" / "mesh_quality_report",
         "bench_remesh_main":   root / "build_main" / "bench_remesh_main",
     }

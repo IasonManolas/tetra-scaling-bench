@@ -78,7 +78,12 @@ int main(int argc, char** argv)
   C3t3 c3t3;
   T3& tr = c3t3.triangulation();
   std::ifstream is(input, std::ios_base::in);
-  if(!CGAL::IO::read_MEDIT(is, tr))
+  // allow_non_manifold: read_MEDIT rejects a non-manifold triangulation by
+  // default, and that refusal is fatal to a whole measurement cell. It costs
+  // nothing on a manifold input and keeps one awkward mesh from taking an arm
+  // down with it. (The same flag is required in mesh_quality_report -- see the
+  // note there; remeshed Mesh_3 outputs genuinely are non-manifold.)
+  if(!CGAL::IO::read_MEDIT(is, tr, CGAL::parameters::allow_non_manifold(true)))
     fatal_error(std::string("Could not read input mesh '") + input + "'");
 
   const std::string input_name = std::filesystem::path(input).stem().string();

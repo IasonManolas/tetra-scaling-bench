@@ -88,6 +88,16 @@ def load_rows(results_dir):
             if r.get("cell_edge_mean") and r.get("target_edge_length"):
                 r["edge_conformance"] = r["cell_edge_mean"] / r["target_edge_length"]
 
+            # prepare_meshes.py names every input <thingi id>_<pipeline>.mesh, so
+            # the generator that produced the input travels with the row.
+            name = r["mesh"]
+            if "_" in name:
+                base, _, suffix = name.rpartition("_")
+                if suffix in ("cdt", "mesh3"):
+                    r["thingi_id"], r["pipeline"] = base, suffix
+            r.setdefault("thingi_id", name)
+            r.setdefault("pipeline", "unknown")
+
             rows.append(r)
     return rows
 
@@ -191,6 +201,24 @@ def section_scaling(agg, out, threads_max):
                 fmt(mainw / w if mainw and w else None, "%.2fx"),
                 fmt(sp1 / t if sp1 else None, "%.2f"),
                 fmt(a["peak_rss_kb"] and a["peak_rss_kb"] / 1024, "%.0f")))
+        # More threads taking longer is physically possible past the scaling
+        # knee, but more threads being FASTER at a lower count than a higher one
+        # by a wide margin usually means drift between measurement epochs, not a
+        # property of the code. Say so rather than letting it read as a result.
+        walls = [(t, agg[(mesh, factor, "par", t)]["median_wall"]) for t in par_t]
+        inversions = [(t1, w1, t2, w2)
+                      for (t1, w1), (t2, w2) in zip(walls, walls[1:])
+                      if w2 > w1 * 1.05]
+        if inversions:
+            t1, w1, t2, w2 = inversions[0]
+            out.append("")
+            out.append("> **Non-monotonic**: %d threads (%.1fs) is slower than %d "
+                       "(%.1fs). Past the scaling knee this can be real; a large "
+                       "gap more often means the two were measured at different "
+                       "times on a drifting machine. Check `started_at` in "
+                       "`all_runs.csv` and the CV column before quoting these."
+                       % (t2, w2, t1, w1))
+
         for arm, w in (("seq", seq), ("main", mainw)):
             if w:
                 a = agg[(mesh, factor, arm, 1)]
@@ -252,6 +280,103 @@ def section_totals(agg, out, threads_max):
         out.append("_%d of %d configs are excluded from this table because not "
                    "every arm covers them; they still appear per-config above._\n"
                    % (len(all_configs) - len(common), len(all_configs)))
+
+
+def load_manifest(results_dir, explicit=None):
+    """The input manifest, if it can be found, keyed by .mesh stem.
+
+    It carries whether each Mesh_3 input actually hit its CDT's cell count,
+    which decides whether a CDT-vs-Mesh_3 row is a controlled comparison.
+    """
+    cands = [Path(explicit)] if explicit else []
+    cands += [results_dir.parent / "meshes" / "manifest.json",
+              results_dir / "manifest.json"]
+    for cand in cands:
+        if cand.exists():
+            try:
+                return json.loads(cand.read_text()).get("meshes", {})
+            except Exception:
+                pass
+    return {}
+
+
+def section_pipelines(agg, rows, out, manifest):
+    """The ours-vs-main comparison, computed separately per input generator.
+
+    These two have disagreed on the SIGN of that comparison before (0.95 on one
+    set, 1.20 on the other), which is why both are measured. Reporting only the
+    pooled number would average that disagreement away and hide the one thing
+    this split exists to show.
+    """
+    pipe_of = {}
+    for r in rows:
+        pipe_of[r["mesh"]] = r.get("pipeline", "unknown")
+    pipes = sorted({p for p in pipe_of.values() if p != "unknown"})
+    if len(pipes) < 2:
+        return
+
+    # A Mesh_3 input that missed its CDT's cell count differs in SIZE as well as
+    # in element quality, so including it turns a controlled comparison into a
+    # confounded one. Drop those here and say how many were dropped.
+    unmatched = set()
+    for stem, rec in manifest.items():
+        if rec.get("pipeline") == "mesh3" and rec.get("target_cells") \
+                and not rec.get("matched"):
+            unmatched.add(stem)
+            unmatched.add(stem.replace("_mesh3", "_cdt"))   # drop its partner too
+
+    out.append("## CDT vs Mesh_3 inputs\n")
+    out.append("The same surfaces, tetrahedralized two ways, with Mesh_3 sized to "
+               "match each CDT's cell count. Each row is a total over the configs "
+               "of that pipeline measured by every arm in the row.\n")
+    if unmatched and manifest:
+        out.append("_%d input(s) are excluded because the Mesh_3 build missed its "
+                   "CDT's cell count, so the pair differs in size as well as "
+                   "quality: %s._\n"
+                   % (len(unmatched), ", ".join(sorted(unmatched))))
+    out.append("| pipeline | configs | main (s) | seq (s) | seq vs main | par@max (s) | par vs main |")
+    out.append("|---|---:|---:|---:|---:|---:|---:|")
+
+    maxt = max((t for (m, f, a, t) in agg if a == "par"), default=1)
+    disagree = []
+    for p in pipes:
+        cfgs = sorted({(m, f) for (m, f, a, t) in agg
+                       if pipe_of.get(m) == p and m not in unmatched})
+        usable = [c for c in cfgs
+                  if (c[0], c[1], "main", 1) in agg
+                  and (c[0], c[1], "seq", 1) in agg]
+        if not usable:
+            out.append("| %s | 0 | - | - | - | - | - |" % p)
+            continue
+        tm = sum(agg[(c[0], c[1], "main", 1)]["median_wall"] for c in usable)
+        ts = sum(agg[(c[0], c[1], "seq", 1)]["median_wall"] for c in usable)
+        with_par = [c for c in usable if (c[0], c[1], "par", maxt) in agg]
+        tp = sum(agg[(c[0], c[1], "par", maxt)]["median_wall"] for c in with_par) \
+            if len(with_par) == len(usable) else None
+        ratio_seq = tm / ts if ts else None
+        disagree.append((p, ratio_seq))
+        out.append("| %s | %d | %s | %s | %s | %s | %s |" % (
+            p, len(usable), fmt(tm, "%.1f"), fmt(ts, "%.1f"),
+            fmt(ratio_seq, "%.3fx"),
+            fmt(tp, "%.1f") if tp else "-",
+            fmt(tm / tp if tp else None, "%.2fx")))
+    out.append("")
+
+    known = [(p, r) for p, r in disagree if r]
+    if len(known) >= 2:
+        lo, hi = min(r for _, r in known), max(r for _, r in known)
+        if (lo - 1.0) * (hi - 1.0) < 0:
+            out.append("> **The two pipelines disagree on the sign.** `seq` is "
+                       "%s on one generator and %s on the other (%s). The pooled "
+                       "number is not a meaningful summary here; quote the two "
+                       "separately.\n" % (
+                           "faster than main" if hi > 1 else "slower than main",
+                           "slower" if lo < 1 else "faster",
+                           ", ".join("%s %.3fx" % (p, r) for p, r in known)))
+        else:
+            out.append("> Both pipelines agree in direction (%s), so the pooled "
+                       "comparison is safe to quote.\n"
+                       % ", ".join("%s %.3fx" % (p, r) for p, r in known))
 
 
 def section_quality(agg, out):
@@ -395,6 +520,9 @@ def main():
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--results", required=True, help="the results directory")
     ap.add_argument("--out", help="where to write the report (default <results>/../report)")
+    ap.add_argument("--manifest",
+                    help="the input manifest.json, if it is not beside the "
+                         "results directory")
     args = ap.parse_args()
 
     results_dir = Path(args.results).resolve()
@@ -419,9 +547,28 @@ def main():
     out = ["# Parallel tetrahedral remeshing: scaling and quality\n",
            "%d runs, %d distinct (mesh, factor, arm, threads) cells.\n"
            % (len(rows), len(agg))]
+    # If calibration never found a config that ran long enough, every timing
+    # below sits closer to the noise floor than intended. That has to be said
+    # once at the top, not left for the reader to infer from the CV column.
+    cpath = results_dir / "calibration.json"
+    if cpath.exists():
+        try:
+            calib = json.loads(cpath.read_text())
+            if calib.get("met_target") is False:
+                out.append("> **Calibration missed its target.** No configuration "
+                           "reached %.0f s at %d threads, so the sweep fell back to "
+                           "the longest runs available. Everything below is noisier "
+                           "than intended; check the CV column before quoting any "
+                           "single number, and prefer the set totals.\n"
+                           % (calib.get("target_seconds", 30),
+                              calib.get("threads_max", 24)))
+        except Exception:
+            pass
+
     section_env(results_dir, out)
     section_scaling(agg, out, threads_max)
     section_totals(agg, out, threads_max)
+    section_pipelines(agg, rows, out, load_manifest(results_dir, args.manifest))
     section_quality(agg, out)
     section_validity(rows, agg, out)
 

@@ -18,6 +18,55 @@ claim in this project rests on 1→4 threads. This kit exists to get numbers on 
 
 ---
 
+## TL;DR — the whole run
+
+```bash
+git clone https://github.com/IasonManolas/tetra-scaling-bench.git
+cd tetra-scaling-bench
+
+nohup python3 run_all.py --off-dir /path/to/thingi10k > run.log 2>&1 &
+```
+
+That is the whole thing: build, prepare inputs, measure (~12 h), derive quality,
+package. It checks its prerequisites and free disk **before** starting anything
+long, so it fails in seconds rather than four hours in. At the end it names one
+`work/results_*.tar.gz` — send that back.
+
+The machine should be otherwise idle for the measurement stage. `run_all.py`
+tries to set the CPU governor to `performance` first and tells you if it could
+not (that needs root; without it the timings drift more but are still usable).
+
+**Interrupting is safe.** Every stage is idempotent — re-running the exact same
+command skips finished builds, prepared meshes and completed measurement cells,
+and carries on. `--dry-run` prints the plan without doing anything.
+
+Useful knobs: `--budget` (measurement seconds, default 12 h), `--threads-max`,
+`--limit` (how many surfaces to prepare), `--tbb-dir`, `--skip-quality`.
+
+<details>
+<summary>Running the stages by hand instead</summary>
+
+```bash
+python3 scripts/setup.py --root work                     # ~15 min
+python3 scripts/prepare_meshes.py --root work \
+        --off-dir /path/to/thingi10k --jobs 24           # ~1-3 h, one time
+
+nohup python3 scripts/run_bench.py --root work \
+        --profile full --budget 43200 > run.log 2>&1 &   # ~12 h, unattended
+
+python3 scripts/run_bench.py --root work --quality-pass   # ~1 h, afterwards
+```
+
+The quality pass is post-processing — it reads the meshes the run saved, so it
+can happen whenever and the machine can be busy.
+
+</details>
+
+If TBB is somewhere CMake cannot find it, add
+`--tbb-dir /path/to/dir/with/TBBConfig.cmake` to `setup.py`.
+
+---
+
 ## What you need
 
 - Linux, a C++17 compiler, CMake ≥ 3.12, Python 3.8+, git
@@ -28,9 +77,12 @@ claim in this project rests on 1→4 threads. This kit exists to get numbers on 
   TBB includes at all, while this branch's `Parallel_tag` path has nine. Without
   it there is no parallel arm at all, so `setup.py` refuses to continue rather
   than quietly building a `bench_remesh` whose `--tag par` is a fiction.
-- The **Thingi10K "fixed"/autorefined** dataset as `.off` files (~640 MB for the
-  full set; the 100 models this kit uses are ~18 MB of it)
-- ~60 GB free disk for the derived meshes and the saved outputs
+- The **Thingi10K** dataset (https://github.com/Thingi10K/Thingi10K). It ships
+  `.stl`, which is what `prepare_meshes.py` takes by default. A repaired or
+  autorefined `.off` set also works and survives CDT construction on more of the
+  awkward models — pass `--prefer-format off` to take those where both exist.
+  Only the 100 model ids in `meshes/thingi_ids.txt` are used.
+- ~20 GB free disk (see **Disk** below)
 - `matplotlib`, optionally, for plots in the final report
 
 The machine should be **otherwise idle** while a measurement runs, and ideally on
@@ -52,20 +104,84 @@ Clones both CGAL trees shallowly, builds four binaries, verifies `bench_remesh`
 actually linked TBB, and records every SHA and binary md5 in
 `work/toolchain.json`.
 
-### 2. Prepare the meshes (~1–2 h, one time, untimed)
+### 2. Prepare the meshes (~2–4 h, one time, untimed)
 
 ```bash
-python3 scripts/prepare_meshes.py --root work --off-dir /path/to/thingi10k_off
+python3 scripts/prepare_meshes.py --root work --off-dir /path/to/thingi10k
 ```
 
-Turns each `.off` into the constrained Delaunay `.mesh` the benchmark reads, and
-writes `work/meshes/manifest.json` with each mesh's cell count. Parallel across
-cores, restartable, and it never leaves a half-written `.mesh` behind.
+Each surface produces **two** tetrahedral inputs:
 
-Only the `.off` inputs (~18 MB) are distributed; the `.mesh` files (~720 MB) are
-derived, which is why this regenerates them instead of shipping them.
+- `<id>_cdt.mesh` — `make_conforming_constrained_Delaunay_triangulation_3`; the
+  surface's own triangles are kept as constraints.
+- `<id>_mesh3.mesh` — `make_mesh_3`, sized to hit the same cell count as that
+  surface's CDT.
 
-### 3. Calibrate — **run this first and send the result back** (30 min)
+Both, because they are not interchangeable: on this project's earlier
+measurements the CDT set and the Mesh_3 set **disagreed on the sign** of the
+sequential ours-vs-main comparison (0.95 vs 1.20). A benchmark built on one
+alone reports a property of the input generator as if it were a property of the
+remesher. Matching the cell counts is what makes the pair controlled — the two
+inputs then differ in element quality, not in size.
+
+Mesh_3 sizing is iterative: cell count against sizing is only roughly a cube
+law, so the script fits the exponent from its own last two builds and retries
+until it is within 15% of the target, keeping the closest attempt. It prints
+which pairs failed to match, and `report.py` leaves those out of the
+CDT-vs-Mesh_3 comparison. Expect a few genuine failures — some surfaces make
+Mesh_3 fail outright at finer sizings.
+
+By default this builds only the **30 largest** surfaces of the 100, because the
+sweep uses about a dozen configs and picks the biggest ones — building all 100
+mostly buys preprocessing time. `--limit 0` builds them all; `--budget <seconds>`
+caps the stage.
+
+Restartable, parallel across cores, and it never leaves a half-written `.mesh`.
+`--pipelines cdt` or `--pipelines mesh3` restricts it if you only want one.
+
+### 3. Run it (one command, ~12 h, unattended)
+
+```bash
+nohup python3 scripts/run_bench.py --root work --profile full --budget 43200 \
+  > run.log 2>&1 &
+```
+
+This is the whole measurement: it calibrates, sizes its own grid from what it
+measured, and runs the sweep. **Nothing needs to be sent back mid-run and
+nothing needs deciding partway.** Quality metrics and the report are separate
+steps — they read the meshes this leaves behind, so they do not belong inside
+the window where the machine has to stay idle.
+
+It splits the budget rather than sharing it, so calibration cannot overrun into
+the sweep:
+
+| phase | share of 12 h | what it does |
+|---|---|---|
+| calibration | ~0.7 h | finds which `(mesh, edge factor)` pairs make a 24-thread run last ≥30 s, and measures this machine's noise and serial ratio |
+| sweep | ~11.3 h | the grid, in priority waves |
+
+The sweep runs in **priority waves**, not config by config. Wave 1 gives *every*
+config its headline numbers (`par@24`, `par@1`, `seq`, `main`); wave 2 fills in
+intermediate thread counts; wave 3 adds repeats. So if the budget runs out —
+and on an unattended run nobody is there to notice — the result is a complete
+dataset at coarser resolution, rather than three perfect configs and nothing for
+the rest.
+
+If it is interrupted, re-running the same command resumes where it stopped.
+
+Useful knobs: `--threads-max` (default 24), `--reps` (3), `--max-configs` (12).
+
+**Set the CPU governor to `performance` first** if you can — the script warns if
+it is not. On a `powersave` laptop we measured 25% drift between waves, enough
+to make a 2-thread run look faster than a 4-thread one. Every row records
+`started_at` so drift is detectable afterwards, and the report flags
+non-monotonic scaling rather than presenting it as a result, but neither is a
+substitute for a machine that holds its clock.
+
+<details>
+<summary>Running the phases separately instead</summary>
+
+### 3a. Calibrate only (30 min)
 
 ```bash
 python3 scripts/run_bench.py --root work --profile calibrate
@@ -78,30 +194,28 @@ down (0.5 → 0.25; output cells grow roughly as `factor^-3`, so that is ~8× th
 work). It then measures run-to-run CV and sketches the scaling curve.
 
 It runs under a **hard 30-minute budget** and does the most valuable work first,
-so a truncated run is still useful. Stage 4 deliberately takes its
-single-threaded anchors on the *smallest* config: a 30 s-at-24-threads workload
-can take ten minutes on one thread and would eat the whole budget alone.
+so a truncated run is still useful. Its single-threaded anchors go on the
+largest config that still *fits* single-threaded — a config sized for the 30 s
+bar takes ~25 minutes on one thread and would blow the budget, while a
+sub-second one measures process start-up rather than remeshing.
 
-**Send back `work/results/calibration.json`.** That sizes the real run.
-
-### 4. Overnight (~12 h, resumable)
+### 3b. Sweep, then quality
 
 ```bash
 nohup python3 scripts/run_bench.py --root work --profile overnight > overnight.log 2>&1 &
-```
-
-Prints an ETA (using the serial ratio calibration actually measured, not an
-assumption of perfect scaling) before starting. If it is interrupted, just run it
-again — it resumes. If anything dies on a signal it stops the whole sweep, so a
-crash gets fixed rather than papered over.
-
-### 5. Quality pass (after the sweep, on the same machine)
-
-```bash
 python3 scripts/run_bench.py --root work --quality-pass
 ```
 
-### 6. Send back
+The sweep prints an ETA from the serial ratio calibration actually measured,
+rather than assuming perfect scaling. If it dies on a signal it stops
+everything, so a crash gets fixed rather than papered over.
+
+</details>
+
+### 4. Send back
+
+`--profile full` writes a single `work/results_<host>_<date>.tar.gz` — send that.
+Running the phases by hand instead, send:
 
 ```
 work/results/results.csv
@@ -111,7 +225,25 @@ work/results/env.json
 work/results/calibration.json
 ```
 
-A few MB. **Keep `work/out_meshes/` where it is** — that is the archive.
+A few MB either way. **Keep `work/out_meshes/` where it is** — that is the
+archive, and it is what lets a metric nobody thought of today be computed later
+without re-running the benchmark.
+
+---
+
+## Disk
+
+About **10–20 GB** end to end, measured at ~40 bytes per output cell:
+
+| | |
+|---|---|
+| Thingi10K surfaces | ~0.7 GB |
+| 200 input `.mesh` files (100 surfaces × 2 pipelines) | ~1.5 GB |
+| 2 shallow CGAL clones + build dirs | ~1.0 GB |
+| Output meshes (≈12 configs × 9 arm-points × ~50 MB) | 5–11 GB |
+| JSONs, logs, quality | <0.1 GB |
+
+Pushing to edge factor 0.25 (≈8× the output cells) reaches ~45 GB.
 
 ---
 
@@ -160,7 +292,8 @@ driver/           C++ sources; CMakeLists is configured twice, once per CGAL tre
   mesh_quality_report.cpp offline quality from a saved .mesh
   mesh_quality.h          quality metrics, from the project's perf branch
   edge_metrics.h          the two edge-length metrics, and why they are split
-  preprocess_cdt.cpp      .off -> .mesh
+  preprocess_cdt.cpp      surface -> constrained Delaunay .mesh
+  preprocess_mesh3.cpp    surface -> Mesh_3 .mesh, at a chosen relative size
 meshes/thingi_ids.txt     the 100 curated Thingi10K model ids
 scripts/                  setup / prepare_meshes / run_bench / report
 work/                     everything generated (gitignored)
@@ -186,7 +319,7 @@ On a machine that already has reference data:
 ```bash
 python3 scripts/setup.py --root work --fresh          # builds from nothing
 python3 scripts/prepare_meshes.py --root work --off-dir <off> --only 124534
-md5sum work/meshes/124534.mesh <known-good>/124534.mesh   # must match exactly
+md5sum work/meshes/124534_cdt.mesh <known-good>/124534.mesh   # must match exactly
 python3 scripts/run_bench.py --root work --profile calibrate --threads-max 4 --budget 420
 # interrupt it, re-run: it must resume and still reach the same conclusions
 python3 scripts/run_bench.py --root work --quality-pass

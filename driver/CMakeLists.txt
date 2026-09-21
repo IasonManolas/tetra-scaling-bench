@@ -46,6 +46,7 @@ if(ARM STREQUAL "ours")
 
   bench_add_target(bench_remesh        bench_remesh.cpp)
   bench_add_target(preprocess_cdt      preprocess_cdt.cpp)
+  bench_add_target(preprocess_mesh3    preprocess_mesh3.cpp)
   bench_add_target(mesh_quality_report mesh_quality_report.cpp)
 
   if(NOT TARGET CGAL::TBB_support)
