@@ -393,7 +393,28 @@ empty file is a failed run wearing the costume of a clean one. The report also
 flags this, and `$R/diagnostics/summary.json` records each run's exit status
 beside its output for exactly this reason.
 
-**5. No timing that is obviously wrong.** Skim the wall-time column for a run
+**5. The lock-grid sweep really swept.** Five distinct grids, not one grid five
+times:
+
+```bash
+awk -F, 'NR==1 {for (i=1; i<=NF; i++) c[$i]=i; next}
+         $c["lock_grid"] != "" {print $c["lock_grid"]}' $R/results.csv \
+    | sort -n | uniq -c
+```
+
+Expect five lines, `16 24 32 48 64`. If they all read the same number, the
+build ignored `CGAL_TETRAHEDRAL_REMESHING_LOCK_GRID` — you are on a branch that
+predates it, and those runs measured one configuration repeatedly. Note that an
+unset run is not a distinguishing test: with the variable unset the remesher
+derives the count from the thread count, and that rule returns 16 at anything up
+to 4 threads anyway. The stage-timing build prints the grid it actually used, so
+this settles it directly:
+
+```bash
+grep LOCKGRID $R/diagnostics/*topstage.out
+```
+
+**6. No timing that is obviously wrong.** Skim the wall-time column for a run
 that took far longer than its neighbours — that is usually something else
 having been running on the machine at the time. Every row records the time it
 started, so a suspect row can be identified and redone rather than the whole
