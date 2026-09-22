@@ -115,24 +115,37 @@ def preprocess_cdt(exe, src, mesh_path, timeout):
         return {"status": "failed", "rc": r.returncode, "stderr": (r.stderr or "")[-400:]}
 
     m = CDT_LINE.search(r.stdout or "")
+    # Counted from the file, for the same reason as in _mesh3_build: this is the
+    # number the Mesh_3 sizing targets and the number the sweep ranks on, so it
+    # has to mean the same thing however it was obtained.
+    cells = _cells_from_medit(tmp)
     os.replace(tmp, mesh_path)
     return {"status": "ok", "pipeline": "cdt",
             "vertices": int(m.group(1)) if m else None,
-            "cells": int(m.group(2)) if m else None}
+            "cells": cells}
 
 
 def _mesh3_build(exe, src, out_path, rel, timeout):
-    """One Mesh_3 build. Returns (cells, vertices) or None."""
+    """One Mesh_3 build. Returns (cells, vertices) or None.
+
+    `cells` is counted from the FILE, not from the preprocessor's stdout. The
+    two disagree -- Mesh_3 reports cells in complex, the CDT tool reports
+    number_of_cells(), and write_MEDIT writes its own selection -- and the
+    sizing loop compares this count against a target read from the CDT file.
+    Mixing the two definitions means optimising toward the wrong number: one
+    pair reported 7% off while the files themselves differed by 32%.
+    """
     r = _run([str(exe), str(src), str(out_path), str(rel)], timeout)
     if r is None or r.returncode != 0 or not out_path.exists():
         out_path.unlink(missing_ok=True)
         return None, (r.stderr[-400:] if r is not None and r.stderr else ""), \
                ("timeout" if r is None else "failed")
     m = MESH3_LINE.search(r.stdout or "")
-    if not m or int(m.group(2)) == 0:
+    cells = _cells_from_medit(out_path)
+    if not cells:
         out_path.unlink(missing_ok=True)
         return None, (r.stdout or "")[-400:], "failed"
-    return (int(m.group(2)), int(m.group(1))), "", "ok"
+    return (cells, int(m.group(1)) if m else None), "", "ok"
 
 
 def preprocess_mesh3(exe, src, mesh_path, target_cells, timeout,
@@ -233,7 +246,12 @@ def build_pair(bins, src, mesh_dir, mesh_id, pipelines, timeout, force,
 
     if "cdt" in pipelines:
         if cdt_path.exists() and not force:
-            out["%s_cdt" % mesh_id] = {"status": "present"}
+            # Already built: never regenerate. Report the cell count read back
+            # off the file so the caller can still record it -- a mesh that
+            # exists but is missing from the manifest is invisible to the sweep,
+            # and in the two-phase flow it would also distort the Mesh_3 ranking.
+            out["%s_cdt" % mesh_id] = {"status": "present", "pipeline": "cdt",
+                                       "cells": _cells_from_medit(cdt_path)}
         else:
             res = preprocess_cdt(bins["preprocess_cdt"], src, cdt_path, timeout)
             out["%s_cdt" % mesh_id] = res
@@ -242,7 +260,8 @@ def build_pair(bins, src, mesh_dir, mesh_id, pipelines, timeout, force,
 
     if "mesh3" in pipelines:
         if m3_path.exists() and not force:
-            out["%s_mesh3" % mesh_id] = {"status": "present"}
+            out["%s_mesh3" % mesh_id] = {"status": "present", "pipeline": "mesh3",
+                                         "cells": _cells_from_medit(m3_path)}
         else:
             # Target the CDT's count so the pair is matched on size. If the CDT
             # is not available (not requested, or it failed), fall back to the
@@ -390,6 +409,24 @@ def main():
 
     def record(i, key, res):
         """Fold one build's result into the manifest and print a line."""
+        if res["status"] == "present":
+            # The file is already there and was not rebuilt. If the manifest
+            # already describes it there is nothing to do and nothing to say;
+            # if it does not -- manifest deleted, or built by an older version --
+            # reconstruct the entry from the file rather than leaving a mesh on
+            # disk that nothing can see.
+            if key in manifest and Path(manifest[key].get("path", "")).exists():
+                return None
+            mp = mesh_dir / (key + ".mesh")
+            if not mp.exists() or not res.get("cells"):
+                return None
+            manifest[key] = {"id": i, "key": key, "pipeline": res["pipeline"],
+                             "path": str(mp), "bytes": mp.stat().st_size,
+                             "sha256": sha256(mp), "vertices": None,
+                             "cells": res["cells"], "source": str(found[i]),
+                             "reused": True}
+            return "%-16s reused  cells=%d" % (key, res["cells"])
+
         if res["status"] == "ok":
             mp = mesh_dir / (key + ".mesh")
             rec = {"id": i, "key": key, "pipeline": res["pipeline"],
@@ -406,8 +443,6 @@ def main():
                 key, res.get("cells"),
                 ("  (target %s)" % res["target_cells"])
                 if res.get("target_cells") else "")
-        if res["status"] == "present":
-            return None
         manifest.pop(key, None)
         return "%-16s %s%s %s" % (key, res["status"],
                                   " (%s)" % res["stage"] if res.get("stage") else "",
