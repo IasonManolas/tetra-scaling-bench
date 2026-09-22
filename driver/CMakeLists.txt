@@ -19,6 +19,17 @@ project(tetra_scaling_bench CXX)
 set(ARM "ours" CACHE STRING "Which arm to build: ours | main")
 set_property(CACHE ARM PROPERTY STRINGS ours main)
 
+# Diagnostic variants of bench_remesh: the same source and the same Release
+# flags, with one macro added, built into their own directory so the timed
+# binary is never rebuilt to get them. CGAL_TR_TOPSTAGE prints one line per
+# top-level stage of remesh(); CGAL_TR_LOCKCOUNT prints retries per elementary
+# operation from a static destructor at exit. Both are read by headers in the
+# CGAL tree, so the definition has to be on the target that compiles them.
+set(BENCH_DEFINES "" CACHE STRING
+    "extra compile definitions for bench_remesh, e.g. CGAL_TR_TOPSTAGE")
+option(BENCH_REMESH_ONLY
+       "build only bench_remesh, for the diagnostic variants" OFF)
+
 if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
   set(CMAKE_BUILD_TYPE Release CACHE STRING "" FORCE)
 endif()
@@ -45,9 +56,15 @@ if(ARM STREQUAL "ours")
   include(CGAL_TBB_support)
 
   bench_add_target(bench_remesh        bench_remesh.cpp)
-  bench_add_target(preprocess_cdt      preprocess_cdt.cpp)
-  bench_add_target(preprocess_mesh3    preprocess_mesh3.cpp)
-  bench_add_target(mesh_quality_report mesh_quality_report.cpp)
+  if(BENCH_DEFINES)
+    target_compile_definitions(bench_remesh PRIVATE ${BENCH_DEFINES})
+  endif()
+
+  if(NOT BENCH_REMESH_ONLY)
+    bench_add_target(preprocess_cdt      preprocess_cdt.cpp)
+    bench_add_target(preprocess_mesh3    preprocess_mesh3.cpp)
+    bench_add_target(mesh_quality_report mesh_quality_report.cpp)
+  endif()
 
   if(NOT TARGET CGAL::TBB_support)
     message(FATAL_ERROR "TBB was found but CGAL::TBB_support was not created; "

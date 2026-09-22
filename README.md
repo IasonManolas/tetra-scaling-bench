@@ -29,7 +29,15 @@ nohup python3 run_all.py --surfaces-dir /path/to/thingi10k --smoke > smoke.log 2
 
 # 2) once that has been checked, the real run: same command, no --smoke
 nohup python3 run_all.py --surfaces-dir /path/to/thingi10k > run.log 2>&1 &
+
+# or, instead of (2), the scaling measurements only, ~45 min:
+nohup python3 run_all.py --surfaces-dir /path/to/thingi10k --metrics > metrics.log 2>&1 &
 ```
+
+**[RUNNING.md](RUNNING.md) is the operator's guide** — prerequisites and how to
+check each one (`perf` is the likely blocker), the exact command for every mode,
+how long each takes, what must be true while it measures, and a checklist for
+telling a good run from a bad one before sending it back.
 
 `--surfaces-dir` points at the Thingi10K `.stl` files (`.off` and `.ply` work too).
 
@@ -184,6 +192,36 @@ the rest.
 If it is interrupted, re-running the same command resumes where it stopped.
 
 Useful knobs: `--threads-max` (default 24), `--reps` (3), `--max-configs` (12).
+
+### 3c. The metrics run (~45 min)
+
+```bash
+nohup python3 run_all.py --surfaces-dir /path/to/thingi10k --metrics > metrics.log 2>&1 &
+```
+
+The scaling questions and nothing else, specified in
+[docs/METRICS_REQUEST.md](docs/METRICS_REQUEST.md): three thread ladders with
+instructions and cycles recorded, a core-pinning comparison, a lock-grid sweep,
+and two instrumented runs. It skips everything the full sweep measures that a
+scaling analysis does not read — the edge-factor ladder, the extra meshes, and
+the `seq` and `main` reference arms, which run at one thread by definition and
+so cannot move with anything tested here.
+
+> **Two of the four phases need code that is not on the target branch yet.**
+> `setup.py` clones `gsoc2026-Tetra_remeshing_parallel-imanolas` from GitHub, and
+> at `bd32d445baa` that branch carries `CGAL_TR_LOCKCOUNT` but neither
+> `CGAL_TR_TOPSTAGE` nor the `CGAL_TETRAHEDRAL_REMESHING_LOCK_GRID` environment
+> variable. Until both are pushed, the lock-grid sweep measures the same build
+> five times over and the stage-timing binary prints nothing. Neither failure
+> announces itself in the log — the lock-grid table simply comes back flat, and
+> the empty stdout capture is what the checklist in RUNNING.md §7 catches.
+
+Like `--smoke`, it writes to its own directories (`metrics_results/`,
+`metrics_out_meshes/`) and shares the build and prepared meshes with the real
+run, so it cannot contaminate a full sweep. It also builds two extra
+diagnostic binaries — the same source and the same Release flags with one macro
+added each — into their own build directories, so the timed binary is never
+rebuilt to get them.
 
 **Set the CPU governor to `performance` first** if you can — the script warns if
 it is not. On a `powersave` laptop we measured 25% drift between waves, enough

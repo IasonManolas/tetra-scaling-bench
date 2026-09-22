@@ -47,8 +47,18 @@ def load_rows(results_dir):
                 r["peak_rss_kb"] = int(r["peak_rss_kb"]) if r["peak_rss_kb"] else None
                 r["remesh_s"] = float(r["remesh_s"]) if r["remesh_s"] else None
                 for k in ("avg_parallelism", "freq_mean_mhz", "freq_min_mhz",
-                          "freq_max_mhz", "user_s", "sys_s"):
+                          "freq_max_mhz", "user_s", "sys_s",
+                          "busy_freq_mean_mhz", "busy_freq_min_mhz",
+                          "busy_freq_max_mhz",
+                          "instructions", "cycles", "task_clock_ms"):
                     r[k] = float(r[k]) if r.get(k) else None
+                # What made this row different from a plain timed run: a taskset
+                # CPU set, a lock-grid value, a diagnostic binary. Rows with a
+                # variant are NOT part of the thread ladder and must not be
+                # aggregated into it.
+                r["variant"] = (r.get("variant") or "").strip()
+                r["pin"] = (r.get("pin") or "").strip()
+                r["lock_grid"] = int(r["lock_grid"]) if r.get("lock_grid") else None
                 r["throttle_events"] = (int(r["throttle_events"])
                                         if r.get("throttle_events") else None)
             except Exception:
@@ -111,10 +121,21 @@ def key(r):
     return (r["mesh"], r["factor"], r["arm"], r["threads"])
 
 
+def plain(rows):
+    """The ordinary timed runs: everything that is not a variant."""
+    return [r for r in rows if not r.get("variant")]
+
+
+def _med(rs, field):
+    """Median of a field over the repeats that have it, or None."""
+    vals = [r[field] for r in rs if r.get(field) is not None]
+    return statistics.median(vals) if vals else None
+
+
 def aggregate(rows):
     """Median wall time and CV per (mesh, factor, arm, threads)."""
     groups = defaultdict(list)
-    for r in rows:
+    for r in plain(rows):
         if r["rc"] == 0 and not r["timed_out"]:
             groups[key(r)].append(r)
 
@@ -140,6 +161,11 @@ def aggregate(rows):
             "avg_parallelism": best.get("avg_parallelism"),
             "freq_mean_mhz": best.get("freq_mean_mhz"),
             "freq_min_mhz": best.get("freq_min_mhz"),
+            "busy_freq_mean_mhz": _med(rs, "busy_freq_mean_mhz"),
+            "busy_freq_min_mhz": _med(rs, "busy_freq_min_mhz"),
+            "instructions": _med(rs, "instructions"),
+            "cycles": _med(rs, "cycles"),
+            "task_clock_ms": _med(rs, "task_clock_ms"),
             "throttle_events": max((r.get("throttle_events") or 0) for r in rs) or None,
         }
     return agg
@@ -332,16 +358,25 @@ def section_machine_behaviour(agg, out):
                "single-core turbo. `throttle` counts throttle entries during the "
                "run — the magnitude is not a severity, but anything above 0 "
                "means the machine was cutting clocks.\n")
-    out.append("| config | threads | wall (s) | used | eff | clock mean (MHz) | clock min | throttle |")
-    out.append("|---|---:|---:|---:|---:|---:|---:|---:|")
+    out.append("`busy clock` is the mean clock of the N cores that were actually "
+               "working, N being the run's thread count. `all-core clock` is the "
+               "mean over every core, idle ones included — it RISES with the "
+               "thread count as idle cores stop dragging it down, which reads "
+               "backwards, and it is shown only so old results sets can be "
+               "compared. Quote the busy column.\n")
+    out.append("| config | threads | wall (s) | used | eff | busy clock (MHz) | "
+               "busy min | all-core clock (MHz) | throttle |")
+    out.append("|---|---:|---:|---:|---:|---:|---:|---:|---:|")
 
     for k, a in sorted(rows, key=lambda kv: (kv[0][0], kv[0][1], kv[0][3])):
         mesh, factor, _, t = k
         used = a["avg_parallelism"]
-        out.append("| %s f=%s | %d | %s | %s | %s | %s | %s | %s |" % (
+        out.append("| %s f=%s | %d | %s | %s | %s | %s | %s | %s | %s |" % (
             mesh, factor, t, fmt(a["median_wall"], "%.1f"), fmt(used, "%.1f"),
             fmt(100.0 * used / t if t else None, "%.0f%%") if used else "-",
-            fmt(a.get("freq_mean_mhz"), "%.0f"), fmt(a.get("freq_min_mhz"), "%.0f"),
+            fmt(a.get("busy_freq_mean_mhz"), "%.0f"),
+            fmt(a.get("busy_freq_min_mhz"), "%.0f"),
+            fmt(a.get("freq_mean_mhz"), "%.0f"),
             a.get("throttle_events") if a.get("throttle_events") is not None else "-"))
     out.append("")
 
@@ -372,6 +407,228 @@ def section_machine_behaviour(agg, out):
                    "requested) and no throttling was recorded, so the speedup "
                    "shortfall is real algorithmic scaling, not the machine.\n"
                    % (100 * worst[0]))
+
+
+
+
+def amdahl_serial_fraction(speedup, threads):
+    """The serial fraction f that would produce exactly this speedup.
+
+    Amdahl's law says S = 1 / (f + (1-f)/p). Solved for f at a measured S and p.
+    Fitting it separately at every thread count is the useful part: a fraction
+    that stays flat as p rises is a genuine serial section, while one that
+    climbs is a cost that grows with the thread count -- contention -- wearing a
+    serial section's clothes.
+    """
+    if not speedup or threads is None or threads <= 1 or speedup <= 0:
+        return None
+    f = (1.0 / speedup - 1.0 / threads) / (1.0 - 1.0 / threads)
+    return f
+
+
+def implied_ghz(cycles, task_clock_ms):
+    """The clock the run actually held: cycles over CPU time on the cores."""
+    if not cycles or not task_clock_ms:
+        return None
+    return cycles / (task_clock_ms / 1000.0) / 1e9
+
+
+def section_thread_ladder(agg, out):
+    """Speedup, the serial fraction behind it, and the work that was executed.
+
+    CPU seconds are not reported here, and deliberately. The same binary on the
+    same input measured +44.6% CPU seconds from one thread to four but only
+    +17.1% instructions and +10.0% cycles -- the rest is the clock falling as
+    more cores light up. Instructions and cycles are the work; `clock` is the
+    part CPU seconds would have blamed on the code.
+    """
+    usable = [k for k in agg if k[2] == "par"]
+    if not usable:
+        return
+    out.append("## Thread ladder: speedup, serial fraction and work\n")
+    out.append("`f` is the serial fraction that fits that one point under "
+               "Amdahl's law, and `ceiling` is the speedup that fraction would "
+               "allow at the widest thread count measured. `instr` and `cycles` "
+               "are relative to the same configuration at one thread. `clock` is "
+               "cycles over task-clock — the frequency the working cores held.\n")
+
+    configs = sorted({(m, f) for (m, f, a, t) in usable})
+    for (mesh, factor) in configs:
+        ts = sorted(t for (m, f, a, t) in usable if m == mesh and f == factor)
+        base = agg.get((mesh, factor, "par", 1))
+        if len(ts) < 2:
+            continue
+        widest = ts[-1]
+        out.append("### %s, edge factor %s\n" % (mesh, factor))
+        if not base:
+            out.append("_No 1-thread run, so speedup and the work ratios cannot "
+                       "be computed for this configuration._\n")
+            continue
+        out.append("| threads | wall (s) | n | speedup | f | ceiling at %d | "
+                   "instr vs 1t | cycles vs 1t | clock (GHz) |" % widest)
+        out.append("|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
+        for t in ts:
+            a = agg[(mesh, factor, "par", t)]
+            sp = base["median_wall"] / a["median_wall"] if a["median_wall"] else None
+            f = amdahl_serial_fraction(sp, t)
+            ceiling = (1.0 / (f + (1 - f) / widest)) if f not in (None, 1.0) else None
+            ir = (a["instructions"] / base["instructions"]
+                  if a.get("instructions") and base.get("instructions") else None)
+            cr = (a["cycles"] / base["cycles"]
+                  if a.get("cycles") and base.get("cycles") else None)
+            out.append("| %d | %s | %d | %s | %s | %s | %s | %s | %s |" % (
+                t, fmt(a["median_wall"], "%.1f"), a["n"],
+                fmt(sp, "%.2fx"),
+                fmt(f and f * 100, "%.1f%%"),
+                fmt(ceiling, "%.2fx"),
+                fmt(ir and (ir - 1) * 100, "%+.1f%%"),
+                fmt(cr and (cr - 1) * 100, "%+.1f%%"),
+                fmt(implied_ghz(a.get("cycles"), a.get("task_clock_ms")), "%.2f")))
+        out.append("")
+
+        if not base.get("instructions"):
+            out.append("> No `instructions`/`cycles` for this configuration, so "
+                       "the work columns are empty. Either `perf` was missing on "
+                       "the benchmark machine or `kernel.perf_event_paranoid` "
+                       "refused it; the run log says which.\n")
+            continue
+        fits = [(t, amdahl_serial_fraction(
+            base["median_wall"] / agg[(mesh, factor, "par", t)]["median_wall"], t))
+            for t in ts if t > 1
+            and agg[(mesh, factor, "par", t)]["median_wall"]]
+        fits = [(t, f) for t, f in fits if f is not None]
+        if len(fits) >= 3:
+            low = [f for t, f in fits if t <= 8]
+            high = [f for t, f in fits if t > 8]
+            if low and high and statistics.fmean(high) > statistics.fmean(low) * 1.2:
+                out.append("> The fitted serial fraction is %.1f%% up to 8 threads "
+                           "and %.1f%% above it. A fraction that only climbs at the "
+                           "wide end is a cost that grows with the thread count, "
+                           "not a serial section — compare the `cycles vs 1t` "
+                           "column at the same rows.\n"
+                           % (100 * statistics.fmean(low), 100 * statistics.fmean(high)))
+
+
+def section_variants(rows, out):
+    """Core pinning and the lock-grid sweep.
+
+    Both are one configuration measured several ways at a fixed thread count, so
+    the comparison is within the block and never against the ladder.
+    """
+    var = [r for r in rows if r.get("variant") and r["rc"] == 0
+           and not r["timed_out"]]
+    if not var:
+        return
+
+    # --- core pinning ---------------------------------------------------
+    pin_rows = [r for r in var if r["variant"].startswith(("unpinned", "pcore",
+                                                           "ecore"))]
+    if pin_rows:
+        out.append("## Core pinning\n")
+        out.append("The same configuration at the same thread count, placed three "
+                   "ways. On a hybrid CPU the cores are not interchangeable, so a "
+                   "pinned run beating the unpinned one means the scheduler's "
+                   "placement is part of the loss — a different problem from lock "
+                   "contention, with a different fix. `pin` is the CPU list "
+                   "`taskset` was given.\n")
+        out.append("| config | threads | placement | pin | n | wall (s) | vs unpinned | "
+                   "instr | cycles | clock (GHz) |")
+        out.append("|---|---:|---|---|---:|---:|---:|---:|---:|---:|")
+        groups = defaultdict(list)
+        for r in pin_rows:
+            groups[(r["mesh"], r["factor"], r["threads"], r["variant"])].append(r)
+        base = {}
+        for k, rs in groups.items():
+            if k[3] == "unpinned":
+                base[k[:3]] = statistics.median(r["wall_s"] for r in rs)
+        for k in sorted(groups, key=lambda k: (k[0], k[1], k[2], k[3])):
+            rs = groups[k]
+            w = statistics.median(r["wall_s"] for r in rs)
+            b = base.get(k[:3])
+            out.append("| %s f=%s | %d | %s | `%s` | %d | %s | %s | %s | %s | %s |" % (
+                k[0], k[1], k[2], k[3], rs[0].get("pin") or "-", len(rs),
+                fmt(w, "%.1f"), fmt(b / w if b and w else None, "%.2fx"),
+                fmt(_gmed(rs, "instructions"), "%.3g"),
+                fmt(_gmed(rs, "cycles"), "%.3g"),
+                fmt(implied_ghz(_gmed(rs, "cycles"), _gmed(rs, "task_clock_ms")),
+                    "%.2f")))
+        out.append("")
+
+    # --- lock grid ------------------------------------------------------
+    lg_rows = [r for r in var if r.get("lock_grid")]
+    if lg_rows:
+        out.append("## Lock grid\n")
+        out.append("`CGAL_TETRAHEDRAL_REMESHING_LOCK_GRID` is the number of lock "
+                   "cells per axis, read once per remesher. The built-in default "
+                   "was chosen at four threads, so this says whether it still "
+                   "holds at the widest.\n")
+        out.append("| config | threads | grid | n | wall (s) | vs best | instr | "
+                   "cycles |")
+        out.append("|---|---:|---:|---:|---:|---:|---:|---:|")
+        groups = defaultdict(list)
+        for r in lg_rows:
+            groups[(r["mesh"], r["factor"], r["threads"], r["lock_grid"])].append(r)
+        walls = {}
+        for k, rs in groups.items():
+            walls[k] = statistics.median(r["wall_s"] for r in rs)
+        best = {}
+        for k, w in walls.items():
+            cur = best.get(k[:3])
+            if cur is None or w < cur[1]:
+                best[k[:3]] = (k[3], w)
+        for k in sorted(groups):
+            rs, w = groups[k], walls[k]
+            bgrid, bw = best[k[:3]]
+            out.append("| %s f=%s | %d | %d | %d | %s | %s | %s | %s |" % (
+                k[0], k[1], k[2], k[3], len(rs), fmt(w, "%.1f"),
+                fmt(bw / w, "%.2fx"),
+                fmt(_gmed(rs, "instructions"), "%.3g"),
+                fmt(_gmed(rs, "cycles"), "%.3g")))
+        out.append("")
+        for cfg, (bgrid, bw) in sorted(best.items()):
+            out.append("- `%s f=%s` at %d threads is fastest at grid **%d** (%.1f s)."
+                       % (cfg[0], cfg[1], cfg[2], bgrid, bw))
+        out.append("")
+
+
+def _gmed(rs, field):
+    vals = [r[field] for r in rs if r.get(field) is not None]
+    return statistics.median(vals) if vals else None
+
+
+def section_diagnostics(results_dir, out):
+    """What the two instrumented binaries printed, and whether they printed.
+
+    CGAL_TR_LOCKCOUNT reports from a static destructor at exit, so a run that
+    died prints nothing at all. An empty capture is a failed run, which is why
+    the exit status is recorded beside it and checked here.
+    """
+    ddir = results_dir / "diagnostics"
+    spath = ddir / "summary.json"
+    if not spath.exists():
+        return
+    try:
+        summary = json.loads(spath.read_text())
+    except Exception:
+        return
+    out.append("## Instrumented runs\n")
+    out.append("| run | binary | threads | exit | lines of output |")
+    out.append("|---|---|---:|---:|---:|")
+    bad = []
+    for stem in sorted(summary):
+        d = summary[stem]
+        out.append("| `%s` | `%s` | %s | %s | %s |" % (
+            stem, d.get("binary"), d.get("threads"), d.get("rc"),
+            d.get("stdout_lines")))
+        if d.get("rc") != 0 or not d.get("stdout_lines"):
+            bad.append(stem)
+    out.append("")
+    if bad:
+        out.append("> **%d instrumented run(s) produced nothing usable**: %s. "
+                   "`CGAL_TR_LOCKCOUNT` prints its line from a static destructor "
+                   "at exit, so a crash prints nothing — an empty capture is a "
+                   "failure, not a clean run.\n" % (len(bad), ", ".join(bad)))
+    out.append("The captures themselves are in `%s`, verbatim.\n" % ddir.name)
 
 
 def load_manifest(results_dir, explicit=None):
@@ -658,6 +915,9 @@ def main():
             pass
 
     section_env(results_dir, out)
+    section_thread_ladder(agg, out)
+    section_variants(rows, out)
+    section_diagnostics(results_dir, out)
     section_scaling(agg, out, threads_max)
     section_totals(agg, out, threads_max)
     section_machine_behaviour(agg, out)

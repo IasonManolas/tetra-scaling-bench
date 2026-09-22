@@ -101,7 +101,8 @@ def check_prereqs(tbb_dir):
         sys.exit(1)
 
 
-def cmake_build(arm, cgal_dir, build_dir, tbb_dir, jobs, fresh):
+def cmake_build(arm, cgal_dir, build_dir, tbb_dir, jobs, fresh,
+                defines=None, target=None):
     if fresh and build_dir.exists():
         shutil.rmtree(build_dir)
     cfg = ["cmake", "-S", str(REPO_ROOT / "driver"), "-B", str(build_dir),
@@ -109,8 +110,13 @@ def cmake_build(arm, cgal_dir, build_dir, tbb_dir, jobs, fresh):
            "-DCGAL_DIR=" + str(cgal_dir)]
     if tbb_dir and arm == "ours":
         cfg.append("-DTBB_DIR=" + str(tbb_dir))
+    if defines:
+        cfg += ["-DBENCH_DEFINES=" + defines, "-DBENCH_REMESH_ONLY=ON"]
     run(cfg)
-    run(["cmake", "--build", str(build_dir), "-j", str(jobs)])
+    build = ["cmake", "--build", str(build_dir), "-j", str(jobs)]
+    if target:
+        build += ["--target", target]
+    run(build)
 
 
 def md5(path):
@@ -134,6 +140,11 @@ def main():
                     help="do not fetch; use the checkouts as they are")
     ap.add_argument("--fresh", action="store_true",
                     help="delete the build dirs first (proves the kit is self-contained)")
+    ap.add_argument("--diagnostics", action="store_true",
+                    help="also build the two instrumented bench_remesh variants "
+                         "(-DCGAL_TR_TOPSTAGE and -DCGAL_TR_LOCKCOUNT) that "
+                         "--profile metrics runs. Adds ~5-10 min of compiling and "
+                         "does not touch the timed binaries.")
     args = ap.parse_args()
 
     check_prereqs(args.tbb_dir)
@@ -165,6 +176,24 @@ def main():
     print("\n[build] main arm (bench_remesh_main)")
     cmake_build("main", main_tree, root / "build_main", None, args.jobs, args.fresh)
 
+    # The two instrumented binaries. They are diagnostics, not timed arms: same
+    # source, same Release flags, one macro added each, and each in its own
+    # build directory so asking for them never rebuilds the binary the sweep is
+    # measuring with.
+    diag_bins = {}
+    if args.diagnostics:
+        for macro, name in (("CGAL_TR_TOPSTAGE", "bench_remesh_topstage"),
+                            ("CGAL_TR_LOCKCOUNT", "bench_remesh_lockcount")):
+            bdir = root / ("build_ours_" + macro.rsplit("_", 1)[-1].lower())
+            print("\n[build] diagnostic arm (-D%s)" % macro)
+            cmake_build("ours", ours, bdir, args.tbb_dir, args.jobs, args.fresh,
+                        defines=macro, target="bench_remesh")
+            built = bdir / "bench_remesh"
+            if not built.exists():
+                sys.exit("Diagnostic build %s produced no bench_remesh." % macro)
+            diag_bins[name] = {"path": str(built), "md5": md5(built),
+                               "define": macro}
+
     bins = {
         "bench_remesh":        root / "build_ours" / "bench_remesh",
         "preprocess_cdt":      root / "build_ours" / "preprocess_cdt",
@@ -190,6 +219,11 @@ def main():
         "ours_sha": ours_sha, "ours_dir": str(ours), "ours_ref": OURS_REF,
         "main_sha": main_sha, "main_dir": str(main_tree), "main_ref": MAIN_REF,
         "binaries": dict((n, {"path": str(p), "md5": md5(p)}) for n, p in bins.items()),
+        # Kept OUT of "binaries" on purpose: run_bench.py's toolchain lock
+        # compares that dict, so listing the diagnostic binaries there would make
+        # a results directory refuse to resume merely because they were built.
+        # They are never used for a timed comparison.
+        "diag_binaries": diag_bins,
         "cmake": capture(["cmake", "--version"]).splitlines()[0],
         "built_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
     }

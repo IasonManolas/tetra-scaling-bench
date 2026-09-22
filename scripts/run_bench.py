@@ -62,6 +62,32 @@ ANCHOR_MIN_SECONDS = 4.0
 MIN_SWEEP_SECONDS = 600.0
 THREAD_LIST = [1, 2, 4, 8, 12, 16, 24]
 
+# --- the metrics profile ---------------------------------------------------
+# Fixed configurations, named in docs/METRICS_REQUEST.md. They are hard-coded
+# rather than calibrated because the point of this profile is to repeat exactly
+# the configurations the earlier ladder used, with cycles and instructions added,
+# so the two datasets are comparable. Everything else the smoke runs measured
+# answers a different question and is deliberately left out.
+METRICS_LADDER_CONFIGS = [("94665_cdt", 0.3), ("67856_cdt", 0.25),
+                          ("94665_mesh3", 0.25)]
+METRICS_REPS = 3
+METRICS_PIN_CONFIG = ("94665_cdt", 0.3)
+METRICS_PIN_THREADS = 8
+METRICS_LOCK_GRIDS = [16, 24, 32, 48, 64]
+METRICS_LOCK_CONFIGS = [("94665_cdt", 0.3), ("94665_mesh3", 0.25)]
+METRICS_DIAG_CONFIG = ("94665_cdt", 0.3)
+METRICS_DIAG_THREADS = [1, 24]
+LOCK_GRID_ENV = "CGAL_TETRAHEDRAL_REMESHING_LOCK_GRID"
+PERF_EVENTS = "instructions,cycles,task-clock"
+# NOT a comma, even though the request writes `-x,`. perf formats its numbers in
+# the machine's locale before joining them with the separator, so on a machine
+# whose decimal mark is a comma the task-clock row comes out as `183,46,msec,...`
+# and every field after the first shifts by one. That is silent: instructions and
+# cycles still parse, task-clock reads as the number 183 followed by the event
+# name "msec", and the column ends up empty for no visible reason. A semicolon
+# cannot be a decimal mark in any locale.
+PERF_SEP = ";"
+
 # started_at is not decoration. Cells are measured in different epochs -- a
 # calibration cell reused by the sweep can be an hour older than its own
 # repeat -- and machines drift (25% between waves on the test laptop). Without
@@ -77,7 +103,23 @@ CSV_HEADER = ["mesh", "factor", "arm", "threads", "rep", "wall_s", "remesh_s",
               # rising throttle_events mean the machine, not the code.
               "user_s", "sys_s", "cpu_pct", "avg_parallelism",
               "freq_mean_mhz", "freq_min_mhz", "freq_max_mhz", "freq_samples",
-              "throttle_events",
+              # The frequency of the cores that were actually WORKING. The
+              # freq_* columns above average every core including idle ones, so
+              # they rise with the thread count and read backwards; they are kept
+              # only so old and new results sets have the same shape. Quote the
+              # busy_freq_* columns instead.
+              "busy_freq_mean_mhz", "busy_freq_min_mhz", "busy_freq_max_mhz",
+              "busy_freq_samples",
+              # Work, as opposed to CPU seconds. user_s moves with the clock --
+              # the same binary on the same input measured +44.6% CPU seconds
+              # from 1 to 4 threads but only +17.1% instructions -- so it
+              # overstates the waste roughly threefold and cannot be corrected
+              # afterwards. cycles over task_clock_ms is the clock the run held.
+              "instructions", "cycles", "task_clock_ms",
+              # What made this cell different from the plain sweep: an empty
+              # variant is an ordinary timed run. `pin` is the taskset CPU list,
+              # `lock_grid` the value of CGAL_TETRAHEDRAL_REMESHING_LOCK_GRID.
+              "variant", "pin", "lock_grid",
               "out_mesh", "json"]
 
 
@@ -179,6 +221,13 @@ def write_env(root, results_dir):
         "no_turbo": _read_first("intel_pstate/no_turbo"),
         "throttle_events_at_start": _read_throttle_counts(),
         "lscpu": capture(["lscpu"]),
+        # A hybrid CPU's cores are not interchangeable, and which CPU number is
+        # which kind is not fixed across machines. These three are what let the
+        # performance and efficiency sets be identified after the fact, and are
+        # what the core-pinning comparison pinned to.
+        "lscpu_extended": capture(["lscpu", "-e"]),
+        "cpuinfo_max_freq_khz": cpu_max_freqs_khz(),
+        "core_sets": dict(zip(("performance", "efficiency"), core_sets())),
         "numactl": capture(["numactl", "--hardware"]),
         "meminfo": capture(["head", "-3", "/proc/meminfo"]),
         "compiler": capture(["c++", "--version"]).splitlines()[:1],
@@ -189,6 +238,125 @@ def write_env(root, results_dir):
     }
     (results_dir / "env.json").write_text(json.dumps(env, indent=2))
     return env
+
+
+# --------------------------------------------------------------------------
+# perf, and the core sets
+# --------------------------------------------------------------------------
+
+_PERF = {}
+
+
+def perf_usable():
+    """Whether `perf stat` can actually count on this machine.
+
+    Probed once, by counting a trivial command, because the two ways it fails
+    are different: perf may not be installed at all, or it may be installed and
+    refused by kernel.perf_event_paranoid. Either way the run must still happen
+    -- a missing counter is a missing column, not a reason to lose 45 minutes of
+    machine time -- so this returns a verdict rather than exiting.
+    """
+    if "ok" in _PERF:
+        return _PERF["ok"]
+    _PERF["ok"] = False
+    if shutil.which("perf") is None:
+        print("[perf] not on PATH; instructions/cycles/task_clock_ms will be "
+              "empty. Install linux-tools to get them.", file=sys.stderr)
+        return False
+    import tempfile
+    with tempfile.NamedTemporaryFile(suffix=".perf") as tf:
+        try:
+            subprocess.run(["perf", "stat", "-e", PERF_EVENTS, "-x", PERF_SEP,
+                            "-o", tf.name, "true"],
+                           capture_output=True, timeout=60)
+            counted = read_perf(Path(tf.name))
+        except Exception:
+            counted = {}
+    if counted.get("instructions") is None:
+        para = ""
+        try:
+            para = Path("/proc/sys/kernel/perf_event_paranoid").read_text().strip()
+        except Exception:
+            pass
+        print("[perf] present but cannot count (perf_event_paranoid=%s). The "
+              "instructions/cycles/task_clock_ms columns will be empty.\n"
+              "       To enable it:  sudo sysctl -w kernel.perf_event_paranoid=1"
+              % (para or "unknown"), file=sys.stderr)
+        return False
+    _PERF["ok"] = True
+    print("[perf] counting %s" % PERF_EVENTS)
+    return True
+
+
+def read_perf(path):
+    """Parse one `perf stat -x,` file into the three columns we record.
+
+    A counter that could not be read prints `<not counted>` or `<not supported>`
+    where the number goes, so a value that does not parse is simply absent data.
+    """
+    out = {}
+    try:
+        text = Path(path).read_text()
+    except Exception:
+        return out
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split(PERF_SEP)
+        if len(parts) < 3:
+            continue
+        try:
+            # A comma here is a decimal mark, not a separator: see PERF_SEP.
+            value = float(parts[0].replace(",", "."))
+        except ValueError:
+            continue        # <not counted> / <not supported>
+        event = parts[2].strip()
+        if event == "instructions":
+            out["instructions"] = int(value)
+        elif event == "cycles":
+            out["cycles"] = int(value)
+        elif event == "task-clock":
+            # perf reports task-clock in milliseconds.
+            out["task_clock_ms"] = round(value, 3)
+    return out
+
+
+def cpu_max_freqs_khz():
+    """Every logical CPU's maximum clock, keyed by CPU number.
+
+    This is what separates performance cores from efficiency cores on a hybrid
+    part, and it is read at run time rather than hard-coded because the CPU
+    numbering of the two kinds is not fixed across machines or kernels.
+    """
+    out = {}
+    for p in CPU_ROOT.glob("cpu[0-9]*/cpufreq/cpuinfo_max_freq"):
+        try:
+            out[int(p.parent.parent.name[3:])] = int(p.read_text().strip())
+        except Exception:
+            pass
+    return out
+
+
+def core_sets(n=None):
+    """The fastest and the slowest CPUs, as two lists of CPU numbers.
+
+    CPUs are grouped by their maximum clock; the highest group is the
+    performance cores and the lowest the efficiency cores. On a machine whose
+    cores are all the same the two groups coincide, and the caller is told so by
+    getting the same list twice.
+    """
+    freqs = cpu_max_freqs_khz()
+    if not freqs:
+        return [], []
+    groups = {}
+    for cpu, f in freqs.items():
+        groups.setdefault(f, []).append(cpu)
+    fast = sorted(groups[max(groups)])
+    slow = sorted(groups[min(groups)])
+    if n:
+        fast, slow = fast[:n], slow[:n]
+    return fast, slow
 
 
 # --------------------------------------------------------------------------
@@ -266,54 +434,138 @@ def _read_throttle_counts():
     return total if found else None
 
 
-def _read_freqs_khz():
-    """Current clock of every core, in kHz."""
-    out = []
+def _read_freqs_khz_by_cpu():
+    """Current clock of every logical CPU, in kHz, keyed by CPU number."""
+    out = {}
     for p in CPU_ROOT.glob("cpu[0-9]*/cpufreq/scaling_cur_freq"):
         try:
-            out.append(int(p.read_text().strip()))
+            out[int(p.parent.parent.name[3:])] = int(p.read_text().strip())
         except Exception:
             pass
     return out
 
 
+def _read_busy_jiffies():
+    """Per-CPU busy time from /proc/stat, keyed by CPU number.
+
+    Busy is everything except idle and iowait. Only the DIFFERENCE between two
+    reads means anything, which is why the sampler keeps the previous one.
+    """
+    out = {}
+    try:
+        for line in Path("/proc/stat").read_text().splitlines():
+            if not line.startswith("cpu") or line.startswith("cpu "):
+                continue
+            parts = line.split()
+            try:
+                cpu = int(parts[0][3:])
+                v = [int(x) for x in parts[1:]]
+            except ValueError:
+                continue
+            idle = v[3] + (v[4] if len(v) > 4 else 0)
+            out[cpu] = sum(v) - idle
+    except Exception:
+        pass
+    return out
+
+
 class _FreqSampler(threading.Thread):
-    """Samples aggregate CPU clock while a measurement runs.
+    """Samples CPU clock while a measurement runs.
+
+    Two numbers come out of it, and only the second is readable.
+
+    `freq_*` is the mean over every logical CPU, idle ones included. On a 24-core
+    machine running four threads, twenty idle cores sit at their minimum clock
+    and drag that mean down, so it RISES with the thread count -- the opposite of
+    what actually happens to the cores doing the work, and the reason the
+    returned smoke data could not be used to price the clock drop.
+
+    `busy_freq_*` is the mean over the `n_busy` CPUs that burned the most time
+    between this sample and the last one -- the cores the run was actually on.
+    Picking them by busy time rather than by clock matters: sorting the cores by
+    their own frequency and taking the top N would select for high clocks and
+    report a number that is high by construction.
 
     Deliberately light: a handful of small sysfs reads on a 2s period, on one
-    thread, against a job that is saturating every core for tens of seconds.
+    thread, against a job that is saturating cores for tens of seconds.
     """
 
-    def __init__(self, period=2.0):
+    def __init__(self, n_busy=None, period=2.0):
         super().__init__(daemon=True)
         self.period = period
+        self.n_busy = n_busy
         # NOT self._stop: Thread._stop() is an internal method that join()
         # calls, and shadowing it with an Event makes join() raise
         # "'Event' object is not callable".
         self._stop_evt = threading.Event()
-        self.samples = []      # mean MHz across cores, per sample
+        self.samples = []       # mean MHz across every CPU, per sample
+        self.busy_samples = []  # mean MHz across the busiest n_busy CPUs
+        self._prev_busy = _read_busy_jiffies()
 
     def run(self):
         while not self._stop_evt.is_set():
-            f = _read_freqs_khz()
-            if f:
-                self.samples.append(sum(f) / len(f) / 1000.0)
+            freqs = _read_freqs_khz_by_cpu()
+            busy = _read_busy_jiffies()
+            if freqs:
+                self.samples.append(sum(freqs.values()) / len(freqs) / 1000.0)
+                picked = self._busiest(busy, freqs)
+                if picked:
+                    self.busy_samples.append(
+                        sum(freqs[c] for c in picked) / len(picked) / 1000.0)
+            self._prev_busy = busy or self._prev_busy
             self._stop_evt.wait(self.period)
+
+    def _busiest(self, busy, freqs):
+        n = self.n_busy or len(freqs)
+        n = max(1, min(n, len(freqs)))
+        deltas = [(busy.get(c, 0) - self._prev_busy.get(c, 0), c)
+                  for c in freqs if c in busy and c in self._prev_busy]
+        if not deltas:
+            return []
+        deltas.sort(reverse=True)
+        return [c for _, c in deltas[:n]]
+
+    @staticmethod
+    def _stats(samples, prefix):
+        if not samples:
+            return {}
+        s = sorted(samples)
+        return {prefix + "mean_mhz": round(sum(s) / len(s), 1),
+                prefix + "min_mhz": round(s[0], 1),
+                prefix + "max_mhz": round(s[-1], 1),
+                prefix + "samples": len(s)}
 
     def stop(self):
         self._stop_evt.set()
         self.join(timeout=5)
-        if not self.samples:
-            return {}
-        s = sorted(self.samples)
-        return {"freq_mean_mhz": round(sum(s) / len(s), 1),
-                "freq_min_mhz": round(s[0], 1),
-                "freq_max_mhz": round(s[-1], 1),
-                "freq_samples": len(s)}
+        out = self._stats(self.samples, "freq_")
+        out.update(self._stats(self.busy_samples, "busy_freq_"))
+        return out
+
+
+# The status file is written by a tiny shell wrapper around the binary, and is
+# the only honest record of how the binary exited. Both wrappers above it lie:
+# `perf stat` exits 0 for a command killed by a signal, and /usr/bin/time does
+# not re-raise it either, so without this a SIGSEGV reads as a clean pass.
+# $0 is the path to write, $@ is the command.
+_STATUS_SH = '"$@"; s=$?; printf %s "$s" > "$0"; exit $s'
+
+
+def cell_stem(mesh_id, factor, arm, threads, rep, variant=""):
+    """The name every artefact of one cell shares, and its resume key.
+
+    A variant is what made this cell different from a plain timed run -- a
+    taskset CPU set, a lock-grid value, a diagnostic binary. An empty variant
+    reproduces the original spelling exactly, so results directories written
+    before this existed still resume.
+    """
+    stem = "%s_f%s_%s_t%d_r%d" % (mesh_id, factor, arm, threads, rep)
+    return stem + ("_" + variant if variant else "")
 
 
 def run_cell(bins, mesh_path, factor, arm, threads, rep, results_dir,
-             mesh_out_dir, timeout, write_mesh, settle, done=None):
+             mesh_out_dir, timeout, write_mesh, settle, done=None,
+             variant="", pin_cpus=None, extra_env=None, exe=None):
     """Execute one (mesh, factor, arm, threads, rep) cell.
 
     Always returns a dict row. A cell that was already completed by an earlier
@@ -323,7 +575,7 @@ def run_cell(bins, mesh_path, factor, arm, threads, rep, results_dir,
     run must still reach the same conclusions without redoing the work.
     """
     mesh_id = Path(mesh_path).stem
-    stem = "%s_f%s_%s_t%d_r%d" % (mesh_id, factor, arm, threads, rep)
+    stem = cell_stem(mesh_id, factor, arm, threads, rep, variant)
     json_path = results_dir / "json" / (stem + ".json")
     log_path = results_dir / "logs" / (stem + ".log")
 
@@ -350,11 +602,15 @@ def run_cell(bins, mesh_path, factor, arm, threads, rep, results_dir,
                     "wall_s": float(t) if t is not None else 0.0,
                     "remesh_s": t, "peak_rss_kb": "", "rc": 0,
                     "timed_out": 0, "out_mesh": "", "json": str(json_path),
+                    "variant": variant, "pin": ",".join(str(c) for c in pin_cpus)
+                    if pin_cpus else "",
+                    "lock_grid": (extra_env or {}).get(LOCK_GRID_ENV, ""),
                     "cached": 1, "recovered": 1}
         except Exception:
             json_path.unlink(missing_ok=True)
 
-    exe = bins["bench_remesh_main"] if arm == "main" else bins["bench_remesh"]
+    if exe is None:
+        exe = bins["bench_remesh_main"] if arm == "main" else bins["bench_remesh"]
     tag = "seq" if arm in ("seq", "main") else "par"
 
     cmd = [str(exe), str(mesh_path), str(ITERS), str(factor),
@@ -373,14 +629,38 @@ def run_cell(bins, mesh_path, factor, arm, threads, rep, results_dir,
         time.sleep(settle)
 
     rss_file = results_dir / "logs" / (stem + ".time")
-    rss_file.unlink(missing_ok=True)
-    wrapped = cmd
+    perf_file = results_dir / "perf" / (stem + ".perf")
+    status_file = results_dir / "logs" / (stem + ".status")
+    for f in (rss_file, perf_file, status_file):
+        f.unlink(missing_ok=True)
+
+    if pin_cpus:
+        # taskset goes INSIDE the counters, so perf counts the remesher and not
+        # itself, and the pinning applies to the measured process only.
+        cmd = ["taskset", "-c", ",".join(str(c) for c in pin_cpus)] + cmd
+
+    # Innermost: record the remesher's own exit status where nothing above can
+    # hide it. See _STATUS_SH.
+    wrapped = ["sh", "-c", _STATUS_SH, str(status_file)] + cmd
+
     if shutil.which("/usr/bin/time"):
         # %U and %S give CPU time, and CPU time over wall time is the average
         # number of cores actually working. Without it, a low speedup cannot be
         # told apart from the job simply not using the cores it was given.
         wrapped = ["/usr/bin/time", "-f", "%e %M %U %S %P",
-                   "-o", str(rss_file)] + cmd
+                   "-o", str(rss_file)] + wrapped
+
+    counted = perf_usable()
+    if counted:
+        # instructions and cycles are the only honest measure of work here:
+        # CPU seconds move with the clock, which falls as cores light up.
+        perf_file.parent.mkdir(parents=True, exist_ok=True)
+        wrapped = ["perf", "stat", "-e", PERF_EVENTS, "-x", PERF_SEP,
+                   "-o", str(perf_file)] + wrapped
+
+    run_env = dict(os.environ)
+    if extra_env:
+        run_env.update((k, str(v)) for k, v in extra_env.items())
 
     # The whole run goes in its own process group, and a timeout kills the
     # GROUP. subprocess.run(timeout=...) only kills its direct child, which
@@ -391,17 +671,17 @@ def run_cell(bins, mesh_path, factor, arm, threads, rep, results_dir,
     # out 8% slow because an orphan was still running beside them.
     try:
         throttle_before = _read_throttle_counts()
-        sampler = _FreqSampler()
+        sampler = _FreqSampler(n_busy=threads)
         sampler.start()
     except Exception:
-        throttle_before, sampler = None, _FreqSampler()
+        throttle_before, sampler = None, _FreqSampler(n_busy=threads)
 
     t0 = time.time()
     started_at = time.strftime("%Y-%m-%dT%H:%M:%S")
     timed_out = False
     with open(log_path, "w") as log:
         proc = subprocess.Popen(wrapped, stdout=log, stderr=subprocess.STDOUT,
-                                start_new_session=True)
+                                start_new_session=True, env=run_env)
         try:
             rc = proc.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
@@ -409,6 +689,26 @@ def run_cell(bins, mesh_path, factor, arm, threads, rep, results_dir,
             _kill_group(proc)
             rc = proc.returncode if proc.returncode is not None else -9
     wall = time.time() - t0
+
+    # The wrappers' exit status is not the remesher's. Prefer what the shell
+    # recorded; fall back to the outermost wrapper only if the whole group was
+    # killed before it could write. A status of 128+n is a death by signal n,
+    # and is normalised to a negative rc so the sweep's crash check still sees
+    # it as one.
+    inner_rc = None
+    try:
+        raw = status_file.read_text().strip()
+        if raw:
+            inner_rc = int(raw)
+    except Exception:
+        pass
+    if inner_rc is None:
+        inner_rc = rc
+    elif inner_rc >= 128:
+        inner_rc = -(inner_rc - 128)
+    rc = inner_rc
+
+    perf_cols = read_perf(perf_file) if counted else {}
 
     # Instrumentation must never cost a measurement. A 12-hour unattended run
     # losing a cell because a sysfs read misbehaved would be a bad trade for
@@ -472,8 +772,13 @@ def run_cell(bins, mesh_path, factor, arm, threads, rep, results_dir,
            "started_at": started_at, "user_s": user_s, "sys_s": sys_s,
            "cpu_pct": cpu_pct, "avg_parallelism": avg_par,
            "throttle_events": throttled,
+           "instructions": "", "cycles": "", "task_clock_ms": "",
+           "variant": variant,
+           "pin": ",".join(str(c) for c in pin_cpus) if pin_cpus else "",
+           "lock_grid": (extra_env or {}).get(LOCK_GRID_ENV, ""),
            "out_mesh": "" if timed_out else out_mesh, "json": str(json_path)}
     row.update(freq)
+    row.update(perf_cols)
     return row
 
 
@@ -487,8 +792,28 @@ class Sweep:
         self.csv_path = results_dir / "results.csv"
         new = not self.csv_path.exists()
         self.done = self._load_done()
+        # Append under the header the file already has, not the one this version
+        # of the script would write. A results directory started before the
+        # perf columns existed has a shorter header, and writing wider rows into
+        # it would silently shift every column from there on.
+        fields = CSV_HEADER
+        if not new:
+            try:
+                with open(self.csv_path, newline="") as fh:
+                    old = next(csv.reader(fh))
+                if old and set(old) != set(CSV_HEADER):
+                    fields = old
+                    missing = [c for c in CSV_HEADER if c not in old]
+                    if missing:
+                        print("Note: %s has an older header, so these columns "
+                              "cannot be recorded here: %s.\n"
+                              "      Use a fresh --results-dir to get them."
+                              % (self.csv_path.name, ", ".join(missing)),
+                              file=sys.stderr)
+            except Exception:
+                pass
         self.csv_fh = open(self.csv_path, "a", newline="")
-        self.csv = csv.DictWriter(self.csv_fh, fieldnames=CSV_HEADER,
+        self.csv = csv.DictWriter(self.csv_fh, fieldnames=fields,
                                   extrasaction="ignore")
         if new:
             self.csv.writeheader()
@@ -503,9 +828,9 @@ class Sweep:
         with open(self.csv_path, newline="") as fh:
             for r in csv.DictReader(fh):
                 try:
-                    stem = "%s_f%s_%s_t%d_r%d" % (
-                        r["mesh"], r["factor"], r["arm"],
-                        int(r["threads"]), int(r["rep"]))
+                    stem = cell_stem(r["mesh"], r["factor"], r["arm"],
+                                     int(r["threads"]), int(r["rep"]),
+                                     r.get("variant") or "")
                     r["wall_s"] = float(r["wall_s"])
                     r["threads"] = int(r["threads"])
                     r["rep"] = int(r["rep"])
@@ -521,11 +846,11 @@ class Sweep:
     def left(self):
         return self.budget - (time.time() - self.t0) if self.budget else float("inf")
 
-    def is_cached(self, mesh_path, factor, arm, threads, rep):
+    def is_cached(self, mesh_path, factor, arm, threads, rep, variant=""):
         """Whether this cell is already recorded. The budget guards consult this
         first: a cached cell costs no wall time, so a resumed run must not be
         stopped by the budget before it has read its earlier results back."""
-        stem = "%s_f%s_%s_t%d_r%d" % (Path(mesh_path).stem, factor, arm, threads, rep)
+        stem = cell_stem(Path(mesh_path).stem, factor, arm, threads, rep, variant)
         if stem not in self.done:
             return False
         # A CSV row is not enough. A timed-out cell has a row but its JSON was
@@ -534,8 +859,9 @@ class Sweep:
         # 30-minute calibration turns into an hour.
         return (self.results_dir / "json" / (stem + ".json")).exists()
 
-    def affordable(self, seconds, mesh_path, factor, arm, threads, rep):
-        if self.is_cached(mesh_path, factor, arm, threads, rep):
+    def affordable(self, seconds, mesh_path, factor, arm, threads, rep,
+                   variant=""):
+        if self.is_cached(mesh_path, factor, arm, threads, rep, variant):
             return True
         return self.left() >= seconds
 
@@ -1017,13 +1343,269 @@ def profile_full(sweep, bins, meshes, args, root, mesh_out_dir):
     return None
 
 
+# --------------------------------------------------------------------------
+# the metrics profile
+# --------------------------------------------------------------------------
+
+def _metrics_lookup(meshes, wanted):
+    """Resolve hard-coded (mesh key, factor) pairs against the prepared inputs.
+
+    A pair whose mesh was never prepared is reported and dropped rather than
+    made fatal: three ladders minus one is still most of the answer, and a run
+    that refuses to start because one input is missing wastes the machine.
+    """
+    by_key = dict((m["key"], m) for m in meshes)
+    found, missing = [], []
+    for key, factor in wanted:
+        if key in by_key:
+            found.append((by_key[key], factor))
+        else:
+            missing.append(key)
+    if missing:
+        print("  NOT PREPARED, skipping: %s" % ", ".join(sorted(set(missing))),
+              file=sys.stderr)
+    return found
+
+
+def _metrics_run(sweep, bins, mesh, factor, threads, rep, label, common,
+                 args, write_mesh=False, **kw):
+    """One metrics cell, with the budget guard and a one-line report."""
+    variant = kw.get("variant", "")
+    if not sweep.affordable(args.run_timeout, mesh["path"], factor, "par",
+                            threads, rep, variant):
+        print("  budget spent, stopping")
+        return None
+    row = run_cell(bins, mesh["path"], factor, "par", threads, rep,
+                   write_mesh=write_mesh, timeout=args.run_timeout,
+                   **dict(common, **kw))
+    sweep.emit(row)
+    # A cached row comes back from the CSV, where every field is a string.
+    try:
+        instr = "%.1f G instr" % (float(row.get("instructions")) / 1e9)
+    except (TypeError, ValueError):
+        instr = "no counters"
+    print("  %-26s t=%-3d r=%d  %8.1fs  %s%s%s" % (
+        label, threads, rep, row["wall_s"], instr,
+        "  TIMEOUT" if row["timed_out"] else "",
+        "  (cached)" if row.get("cached") else ""), flush=True)
+    return row
+
+
+def metrics_ladder(sweep, bins, meshes, args, common):
+    """1, 2, 4, 8, 12, 16, 24 threads, three reps, reps INTERLEAVED.
+
+    Interleaved means rep 1 of every point, then rep 2, then rep 3 -- not three
+    reps of one point in a row. Machines drift: 25% between measurement waves
+    was measured on the test laptop here. Running all three reps of the 1-thread
+    point together buries that drift inside one point's error bar and moves the
+    whole point relative to the others, which is exactly the comparison the
+    ladder exists to make. Interleaving spreads any drift across every point.
+
+    Within a rep the thread counts descend, so the cheapest runs go first and a
+    truncated rep still covers the wide end.
+    """
+    configs = _metrics_lookup(meshes, METRICS_LADDER_CONFIGS)
+    if not configs:
+        return
+    threads = [t for t in sorted(THREAD_LIST, reverse=True)
+               if t <= args.threads_max]
+    print("\n=== thread ladder: %d config(s) x %s threads x %d reps ==="
+          % (len(configs), threads, args.reps))
+    for rep in range(1, args.reps + 1):
+        for t in threads:
+            for mesh, factor in configs:
+                # One output mesh at each end of the first ladder, and no more.
+                # Parallel against sequential quality is already settled at
+                # 0.25% on cell count; this is a check that nothing regressed,
+                # not a quality sweep.
+                write = (rep == 1 and (mesh, factor) == configs[0]
+                         and t in (1, args.threads_max))
+                _metrics_run(sweep, bins, mesh, factor, t, rep,
+                             "%s f=%s" % (mesh["key"], factor), common, args,
+                             write_mesh=write)
+
+
+def metrics_pinning(sweep, bins, meshes, args, common):
+    """Unpinned against the performance cores against the efficiency cores.
+
+    A hybrid CPU's "24 cores" are not 24 of the core the 1-thread run measured,
+    so part of a scaling shortfall can simply be work landing on slower cores.
+    Eight threads on eight performance cores against eight threads unpinned
+    separates that from lock contention: if the pinned run wins, the scheduler's
+    placement is a real part of the loss.
+    """
+    configs = _metrics_lookup(meshes, [METRICS_PIN_CONFIG])
+    if not configs:
+        return
+    mesh, factor = configs[0]
+    t = min(METRICS_PIN_THREADS, args.threads_max)
+    fast, slow = core_sets(t)
+    if not fast:
+        print("\n=== core pinning: skipped, this machine exposes no "
+              "cpuinfo_max_freq ===", file=sys.stderr)
+        return
+
+    arms = [("unpinned", None)]
+    if fast == slow:
+        print("\n=== core pinning: every core has the same maximum clock, so "
+              "there is no performance/efficiency split to test. Running the "
+              "unpinned arm only. ===")
+    else:
+        arms += [("pcore%d" % t, fast), ("ecore%d" % t, slow)]
+        print("\n=== core pinning on %s f=%s at %d threads ===" %
+              (mesh["key"], factor, t))
+        print("  performance cores: %s" % ",".join(str(c) for c in fast))
+        print("  efficiency  cores: %s" % ",".join(str(c) for c in slow))
+
+    for rep in range(1, args.reps + 1):
+        for name, cpus in arms:
+            _metrics_run(sweep, bins, mesh, factor, t, rep,
+                         "%s %s" % (mesh["key"], name), common, args,
+                         variant=name, pin_cpus=cpus)
+
+
+def metrics_lock_grid(sweep, bins, meshes, args, common):
+    """Sweep CGAL_TETRAHEDRAL_REMESHING_LOCK_GRID at the widest thread count.
+
+    The built-in grid size was chosen at four threads. The environment variable
+    is read once per remesher and never on a locking path, so setting it costs
+    nothing and the sweep is what says whether that choice still holds at 24.
+    """
+    configs = _metrics_lookup(meshes, METRICS_LOCK_CONFIGS)
+    if not configs:
+        return
+    t = args.threads_max
+    print("\n=== lock grid %s at %d threads ===" %
+          (METRICS_LOCK_GRIDS, t))
+    for rep in range(1, args.reps + 1):
+        for grid in METRICS_LOCK_GRIDS:
+            for mesh, factor in configs:
+                _metrics_run(sweep, bins, mesh, factor, t, rep,
+                             "%s grid=%d" % (mesh["key"], grid), common, args,
+                             variant="lg%d" % grid,
+                             extra_env={LOCK_GRID_ENV: grid})
+
+
+def metrics_diagnostics(sweep, bins, meshes, args, common, results_dir):
+    """The two instrumented binaries, once each at one thread and at the widest.
+
+    These are diagnostics, not timings: each is the same source with one macro
+    added, and their wall times are not comparable with the ladder's. What comes
+    back is their stdout, saved verbatim.
+
+    CGAL_TR_LOCKCOUNT prints its one line from a static destructor at exit, so a
+    run that crashed prints nothing at all. An empty capture is therefore a
+    failure and not a quiet pass, which is why the exit status is recorded
+    beside it.
+    """
+    diag = {}
+    for name in ("bench_remesh_topstage", "bench_remesh_lockcount"):
+        if name in bins and Path(bins[name]).exists():
+            diag[name] = Path(bins[name])
+    if not diag:
+        print("\n=== diagnostics: skipped, the instrumented binaries were not "
+              "built. Re-run scripts/setup.py --diagnostics. ===", file=sys.stderr)
+        return
+
+    configs = _metrics_lookup(meshes, [METRICS_DIAG_CONFIG])
+    if not configs:
+        return
+    mesh, factor = configs[0]
+    diag_dir = results_dir / "diagnostics"
+    diag_dir.mkdir(parents=True, exist_ok=True)
+    threads = [t for t in METRICS_DIAG_THREADS if t <= args.threads_max]
+    print("\n=== diagnostics on %s f=%s at %s threads ==="
+          % (mesh["key"], factor, threads))
+
+    summary = {}
+    spath = diag_dir / "summary.json"
+    if spath.exists():
+        try:
+            summary = json.loads(spath.read_text())
+        except Exception:
+            summary = {}
+
+    for name, exe in sorted(diag.items()):
+        variant = name.replace("bench_remesh_", "")
+        for t in threads:
+            row = _metrics_run(sweep, bins, mesh, factor, t, 1,
+                               "%s %s" % (mesh["key"], variant), common, args,
+                               variant=variant, exe=exe)
+            if row is None:
+                continue
+            stem = cell_stem(mesh["key"], factor, "par", t, 1, variant)
+            src = results_dir / "logs" / (stem + ".log")
+            dst = diag_dir / (stem + ".out")
+            try:
+                shutil.copyfile(src, dst)
+            except Exception:
+                pass
+            n_lines = 0
+            try:
+                n_lines = sum(1 for line in dst.read_text().splitlines()
+                              if line.strip())
+            except Exception:
+                pass
+            summary[stem] = {"binary": name, "threads": t, "rc": row["rc"],
+                             "timed_out": row["timed_out"],
+                             "stdout": dst.name, "stdout_lines": n_lines}
+            if row["rc"] != 0 or n_lines == 0:
+                print("  WARNING: %s exited %d and printed %d line(s). An empty "
+                      "capture is a failed run, not a clean one."
+                      % (stem, row["rc"], n_lines), file=sys.stderr)
+    spath.write_text(json.dumps(summary, indent=2))
+    print("  stdout captures and exit statuses in %s" % diag_dir)
+
+
+def profile_metrics(sweep, bins, meshes, args, root, mesh_out_dir):
+    """The scaling questions, and nothing else (docs/METRICS_REQUEST.md).
+
+    About 45 minutes on a 24-core machine, against the 12 hours the full sweep
+    takes, because it runs only what a scaling analysis reads: three thread
+    ladders, a core-pinning comparison, a lock-grid sweep and two instrumented
+    runs. No edge-factor ladder, no extra meshes, and no `seq` or `main`
+    reference arms -- those run at one thread by definition and so cannot move
+    with anything measured here.
+    """
+    common = dict(results_dir=sweep.results_dir, mesh_out_dir=mesh_out_dir,
+                  settle=args.settle, done=sweep.done)
+    phases = {"ladder": lambda: metrics_ladder(sweep, bins, meshes, args, common),
+              "pinning": lambda: metrics_pinning(sweep, bins, meshes, args, common),
+              "lockgrid": lambda: metrics_lock_grid(sweep, bins, meshes, args, common),
+              "diagnostics": lambda: metrics_diagnostics(sweep, bins, meshes, args,
+                                                         common, sweep.results_dir)}
+    wanted = [x.strip() for x in args.metrics_phases.split(",") if x.strip()]
+    unknown = [x for x in wanted if x not in phases]
+    if unknown:
+        sys.exit("Unknown --metrics-phases: %s. Known: %s"
+                 % (", ".join(unknown), ", ".join(phases)))
+
+    print("=" * 70)
+    print("METRICS PROFILE: %s" % ", ".join(wanted))
+    print("Roughly 45 min at 24 threads. The machine must be idle for all of it.")
+    print("=" * 70)
+    for name in wanted:
+        phases[name]()
+
+    print("\n" + "=" * 70)
+    print("METRICS RUN DONE. Package it with:\n")
+    print("    python3 %s --root %s --quality-pass \\\n"
+          "        --results-dir %s --mesh-out-dir %s"
+          % (Path(__file__).name, root, sweep.results_dir, mesh_out_dir))
+    print("=" * 70)
+    return None
+
+
 def package(results_dir, root, mesh_out_dir=None):
     """Bundle exactly what needs to come back, so nobody has to guess."""
     import tarfile
     out = root / ("results_%s_%s.tar.gz" % (platform.node(),
                                             time.strftime("%Y%m%d-%H%M")))
     wanted = ["results.csv", "env.json", "calibration.json",
-              "toolchain_lock.json", "json", "quality"]
+              "toolchain_lock.json", "json", "quality",
+              # the metrics profile's artefacts: the raw perf counter files and
+              # the instrumented runs' stdout, which is the whole point of them
+              "perf", "diagnostics"]
     try:
         with tarfile.open(out, "w:gz") as tf:
             for name in wanted:
@@ -1129,10 +1711,17 @@ def main():
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--root", default=str(REPO_ROOT / "work"))
-    ap.add_argument("--profile", choices=["full", "calibrate", "overnight"],
+    ap.add_argument("--profile",
+                    choices=["full", "calibrate", "overnight", "metrics"],
                     help="'full' does calibrate + sweep + quality + packaging in "
                          "one unattended command (use this if you get one run at "
-                         "the machine); the others are the same phases separately")
+                         "the machine); the others are the same phases separately. "
+                         "'metrics' is the short scaling-only run described in "
+                         "docs/METRICS_REQUEST.md -- about 45 min, and it does not "
+                         "calibrate, since its configurations are fixed")
+    ap.add_argument("--metrics-phases",
+                    default="ladder,pinning,lockgrid,diagnostics",
+                    help="which parts of --profile metrics to run, in order")
     ap.add_argument("--calib-budget", type=float, default=2400.0,
                     help="seconds of the full-profile budget given to calibration")
     ap.add_argument("--quality-pass", action="store_true",
@@ -1171,13 +1760,19 @@ def main():
     tc_path = root / "toolchain.json"
     if not tc_path.exists():
         sys.exit("No %s -- run scripts/setup.py first." % tc_path)
-    bins = dict((n, Path(v["path"]))
-                for n, v in json.loads(tc_path.read_text())["binaries"].items())
+    tc = json.loads(tc_path.read_text())
+    bins = dict((n, Path(v["path"])) for n, v in tc["binaries"].items())
+    # The instrumented binaries are deliberately NOT in tc["binaries"]: the
+    # toolchain lock compares that dict, so adding them there would make a
+    # metrics run refuse to resume a sweep, and a sweep refuse to resume after a
+    # metrics run. They change no timed binary, so they do not belong in it.
+    bins.update((n, Path(v["path"])) for n, v in tc.get("diag_binaries", {}).items())
 
     results_dir = Path(args.results_dir).resolve() if args.results_dir else root / "results"
     mesh_out_dir = Path(args.mesh_out_dir).resolve() if args.mesh_out_dir else root / "out_meshes"
     mesh_dir = Path(args.mesh_dir).resolve() if args.mesh_dir else root / "meshes"
-    for d in (results_dir / "json", results_dir / "logs", mesh_out_dir):
+    for d in (results_dir / "json", results_dir / "logs", results_dir / "perf",
+              mesh_out_dir):
         d.mkdir(parents=True, exist_ok=True)
 
     if args.quality_pass:
@@ -1185,13 +1780,16 @@ def main():
         return
 
     if args.budget is None:
-        args.budget = {"calibrate": 1800.0, "full": 12 * 3600.0}.get(args.profile, 0.0)
+        args.budget = {"calibrate": 1800.0, "full": 12 * 3600.0,
+                       # Generous against the ~45 min the work takes, so a slow
+                       # machine finishes rather than being cut off mid-ladder.
+                       "metrics": 3 * 3600.0}.get(args.profile, 0.0)
     if args.run_timeout is None:
         # 240s was too tight: on a 24-core run the very first ladder probe hit
         # it, and every single-threaded anchor did too, so calibration learned
         # nothing about the serial cost. A single-threaded run of a config that
         # takes ~30s on 24 threads needs room for ~15 minutes.
-        args.run_timeout = 1200 if args.profile == "calibrate" else 14400
+        args.run_timeout = 1200 if args.profile in ("calibrate", "metrics") else 14400
 
     check_toolchain_lock(root, results_dir, args.allow_toolchain_change)
     env = write_env(root, results_dir)
@@ -1233,6 +1831,8 @@ def main():
     try:
         if args.profile == "full":
             profile_full(sweep, bins, meshes, args, root, mesh_out_dir)
+        elif args.profile == "metrics":
+            profile_metrics(sweep, bins, meshes, args, root, mesh_out_dir)
         elif args.profile == "calibrate":
             profile_calibrate(sweep, bins, meshes, args)
         else:

@@ -133,6 +133,13 @@ def main():
                          "measurement, written to separate smoke_* directories so "
                          "it cannot contaminate the real results. The build and the "
                          "prepared meshes it produces are reused by the real run.")
+    ap.add_argument("--metrics", action="store_true",
+                    help="the scaling-only run (~45 min) instead of the 12-hour "
+                         "sweep: three thread ladders with cycles and instructions, "
+                         "a core-pinning comparison, a lock-grid sweep and two "
+                         "instrumented runs. Written to separate metrics_* "
+                         "directories, like --smoke, so it cannot contaminate the "
+                         "real results. It also builds the two diagnostic binaries.")
     ap.add_argument("--skip-quality", action="store_true",
                     help="stop after the measurement (quality can be run later)")
     ap.add_argument("--dry-run", action="store_true",
@@ -146,7 +153,23 @@ def main():
     # -- those are expensive and identical -- but keeps its own results and
     # output meshes. Sharing those would mean the real run resumes on top of
     # smoke-run cells, mixing a throwaway measurement into the real dataset.
-    if args.smoke:
+    if args.smoke and args.metrics:
+        ap.error("--smoke and --metrics are different runs; pass one.")
+
+    # The metrics run is the same build and the same prepared meshes as the real
+    # one -- it measures the very configurations the real sweep measures -- but
+    # it answers only the scaling questions, so it writes its own results
+    # directory for the same reason --smoke does: resuming the real sweep on top
+    # of these cells would mix two different measurements into one dataset.
+    if args.metrics:
+        if args.budget == 12 * 3600:
+            args.budget = 3 * 3600
+        args.reps = 3
+        results_dir = root / "metrics_results"
+        mesh_out_dir = root / "metrics_out_meshes"
+        print("METRICS RUN: the scaling measurements only, roughly 45 min at 24\n"
+              "threads, results in %s\n" % results_dir.name)
+    elif args.smoke:
         if args.limit == 0:             # untouched default
             args.limit = 6
         if args.mesh3_limit == 20:
@@ -233,6 +256,8 @@ def main():
     setup = [py, SCRIPTS / "setup.py", "--root", root, "--jobs", args.jobs]
     if args.tbb_dir:
         setup += ["--tbb-dir", args.tbb_dir]
+    if args.metrics:
+        setup += ["--diagnostics"]
     stage("1-build", setup, log_dir, args.dry_run)
 
     prep = [py, SCRIPTS / "prepare_meshes.py", "--root", root,
@@ -252,7 +277,8 @@ def main():
 
     where = ["--results-dir", results_dir, "--mesh-out-dir", mesh_out_dir]
 
-    measure = [py, SCRIPTS / "run_bench.py", "--root", root, "--profile", "full",
+    measure = [py, SCRIPTS / "run_bench.py", "--root", root,
+               "--profile", "metrics" if args.metrics else "full",
                "--budget", args.budget, "--threads-max", args.threads_max,
                "--reps", args.reps] + where
     if args.smoke:
@@ -275,13 +301,18 @@ def main():
     bundles = sorted(root.glob("results_*.tar.gz"),
                      key=lambda p: p.stat().st_mtime, reverse=True)
     print("\n" + "=" * 72)
-    print("%s DONE in %s." % ("SMOKE RUN" if args.smoke else "ALL",
+    print("%s DONE in %s." % ("METRICS RUN" if args.metrics else
+                              "SMOKE RUN" if args.smoke else "ALL",
                               hrs(time.time() - total0)))
     if bundles:
         size = bundles[0].stat().st_size
         human = ("%.0f KB" % (size / 1e3)) if size < 1e6 else ("%.1f MB" % (size / 1e6))
         print("\nSend back this one file:\n\n    %s   (%s)" % (bundles[0], human))
-    if args.smoke:
+    if args.metrics:
+        print("\nThat is the metrics run. Report it with:\n\n"
+              "    python3 %s --results %s\n"
+              % (SCRIPTS / "report.py", results_dir))
+    elif args.smoke:
         print("\nThat is the smoke run. Once it has been checked, start the real\n"
               "one with the same command minus --smoke -- the build and the\n"
               "prepared meshes are reused, and it writes to results/ rather than\n"
