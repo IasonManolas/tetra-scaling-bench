@@ -380,6 +380,39 @@ def section_machine_behaviour(agg, out):
             a.get("throttle_events") if a.get("throttle_events") is not None else "-"))
     out.append("")
 
+    # The part of the shortfall that is physics, not code. All-core turbo sits
+    # below single-core turbo -- measured at 0.51-0.71 of it on the Core Ultra 9
+    # 285 -- so a run on N threads cannot reach N times the 1-thread wall even
+    # with perfect parallelism and no contention. Stating the capped ceiling
+    # stops that being counted as missing scaling, and it needs the 1-thread
+    # point, which is why the ladder measures one.
+    base = dict(((k[0], k[1]), a.get("busy_freq_mean_mhz"))
+                for k, a in rows if k[3] == 1 and a.get("busy_freq_mean_mhz"))
+    capped = []
+    for k, a in sorted(rows, key=lambda kv: (kv[0][0], kv[0][1], kv[0][3])):
+        one = base.get((k[0], k[1]))
+        wide = a.get("busy_freq_mean_mhz")
+        if one and wide and k[3] and k[3] > 1:
+            capped.append((k, wide / one, k[3] * wide / one))
+    if capped:
+        widest = {}
+        for k, ratio, ceil in capped:
+            widest[(k[0], k[1])] = (k[3], ratio, ceil)
+        out.append("### What the clock alone allows\n")
+        out.append("The cores that work at the widest thread count hold a lower "
+                   "clock than one core working alone, so part of the missing "
+                   "speedup is the frequency, not the code. `clock ratio` is the "
+                   "busy clock at that thread count over the busy clock at one "
+                   "thread, and `ceiling` is what perfect parallelism could reach "
+                   "at that clock — no speedup above it is achievable on this "
+                   "machine.\n")
+        out.append("| config | threads | clock ratio | ceiling |")
+        out.append("|---|---:|---:|---:|")
+        for (mesh, factor), (t, ratio, ceil) in sorted(widest.items()):
+            out.append("| %s f=%s | %d | %.2f | %.1fx |"
+                       % (mesh, factor, t, ratio, ceil))
+        out.append("")
+
     # Say the conclusion rather than leaving it in the table.
     worst = None
     for k, a in rows:
