@@ -149,6 +149,14 @@ def _read_first(rel):
         return ""
 
 
+def _read_first_path(path):
+    """One small file anywhere, stripped, or ''."""
+    try:
+        return Path(path).read_text().strip()
+    except Exception:
+        return ""
+
+
 def check_toolchain_lock(root, results_dir, allow_change):
     """Refuse to extend a results set that was measured with different binaries.
 
@@ -235,6 +243,14 @@ def write_env(root, results_dir):
         # at base clock and would look exactly like poor scaling.
         "no_turbo": _read_first("intel_pstate/no_turbo"),
         "throttle_events_at_start": _read_throttle_counts(),
+        # Whether `perf stat` can actually count on this machine. Without this
+        # the instructions/cycles/task_clock_ms columns come back empty with no
+        # way to tell, from the results set alone, whether the counters were
+        # refused or the run simply predates them -- the explanation goes to
+        # stderr, which a returned tarball does not carry.
+        "perf_counting": perf_usable(),
+        "perf_event_paranoid": _read_first_path(
+            "/proc/sys/kernel/perf_event_paranoid"),
         "lscpu": capture(["lscpu"]),
         # A hybrid CPU's cores are not interchangeable, and which CPU number is
         # which kind is not fixed across machines. These three are what let the
