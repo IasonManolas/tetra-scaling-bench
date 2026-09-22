@@ -268,8 +268,9 @@ def main():
     print("%s DONE in %s." % ("SMOKE RUN" if args.smoke else "ALL",
                               hrs(time.time() - total0)))
     if bundles:
-        print("\nSend back this one file:\n\n    %s   (%.1f MB)"
-              % (bundles[0], bundles[0].stat().st_size / 1e6))
+        size = bundles[0].stat().st_size
+        human = ("%.0f KB" % (size / 1e3)) if size < 1e6 else ("%.1f MB" % (size / 1e6))
+        print("\nSend back this one file:\n\n    %s   (%s)" % (bundles[0], human))
     if args.smoke:
         print("\nThat is the smoke run. Once it has been checked, start the real\n"
               "one with the same command minus --smoke -- the build and the\n"

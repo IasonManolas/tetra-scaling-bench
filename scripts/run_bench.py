@@ -837,9 +837,12 @@ def package(results_dir, root, mesh_out_dir=None):
               % (e, ", ".join(wanted)), file=sys.stderr)
         return None
 
+    size = out.stat().st_size
+    human = ("%.0f KB" % (size / 1e3)) if size < 1e6 else ("%.1f MB" % (size / 1e6))
+    n = sum(1 for _ in tarfile.open(out).getnames())
     print("\n" + "=" * 70)
-    print("DONE. Send back this one file:\n\n    %s   (%.1f MB)"
-          % (out, out.stat().st_size / 1e6))
+    print("DONE. Send back this one file:\n\n    %s   (%s, %d entries)"
+          % (out, human, n))
     print("\nThe output meshes stay here as the archive -- do not delete them, so\n"
           "any further metric can be computed without re-running anything:\n"
           "    %s" % (mesh_out_dir or (root / "out_meshes")))
