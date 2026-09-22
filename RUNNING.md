@@ -90,8 +90,10 @@ compiler is recorded in `env.json` for us, but note what the toolchain lock
 does and does not pin: it pins the two CGAL commits and the checksums of the
 built binaries, **not** your compiler. So do not change compilers or update the
 system toolchain partway through a run — rebuilding with a different compiler
-mid-sweep produces a results set measured with two different binaries, and the
-lock will stop you rather than let that happen silently.
+mid-sweep would produce a results set measured with two different binaries.
+When the lock sees different code, it deletes the previous results and output
+meshes and starts that run over, so after a `git pull` you simply re-run the
+same command.
 
 ### TBB
 

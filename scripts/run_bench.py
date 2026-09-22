@@ -166,7 +166,7 @@ def _read_first_path(path):
         return ""
 
 
-def check_toolchain_lock(root, results_dir, allow_change):
+def check_toolchain_lock(root, results_dir, mesh_out_dir, allow_change):
     """Refuse to extend a results set that was measured with different binaries.
 
     setup.py fetches the branch tip every time it runs, which is what you want
@@ -176,8 +176,11 @@ def check_toolchain_lock(root, results_dir, allow_change):
     SHAs live in env.json, which is rewritten each invocation, so afterwards
     there would be nothing to reveal the mixture.
 
-    The first sweep into a results directory records what it used; later ones
-    must match.
+    The first sweep into a results directory records what it used. A later
+    sweep with the same code resumes; one with different code REPLACES the
+    results directory and the output meshes, so a re-run after a pull needs
+    no manual clean-up and never mixes code versions. The previous run's
+    tarball, if one was made, is left alone.
     """
     tc = json.loads((root / "toolchain.json").read_text())
     # The ref names are recorded as well as the commits. A SHA alone cannot say
@@ -213,13 +216,16 @@ def check_toolchain_lock(root, results_dir, allow_change):
     msg = ("The code changed since this results directory was started:\n%s\n"
            % "\n".join(diffs))
     if not allow_change:
-        sys.exit(msg +
-                 "\nContinuing would append cells measured with different binaries to\n"
-                 "the same results.csv, and nothing in the output would show it.\n"
-                 "Either:\n"
-                 "  - start a fresh results directory (--results-dir), or\n"
-                 "  - rebuild the original commit and re-run, or\n"
-                 "  - pass --allow-toolchain-change if you really mean to mix them.")
+        print(msg + "Replacing the previous results in %s and %s; they were\n"
+              "measured with the old code.\n" % (results_dir, mesh_out_dir),
+              file=sys.stderr)
+        for d in (results_dir, mesh_out_dir):
+            shutil.rmtree(d, ignore_errors=True)
+        for d in (results_dir / "json", results_dir / "logs",
+                  results_dir / "perf", mesh_out_dir):
+            d.mkdir(parents=True, exist_ok=True)
+        lock_path.write_text(json.dumps(now, indent=2))
+        return
     print(msg + "Continuing because --allow-toolchain-change was given; the\n"
           "results set now mixes binaries.", file=sys.stderr)
     lock_path.write_text(json.dumps(now, indent=2))
@@ -1853,9 +1859,10 @@ def main():
                     help="per-run timeout in seconds "
                          "(default 240 for calibrate, 7200 for overnight)")
     ap.add_argument("--allow-toolchain-change", action="store_true",
-                    help="continue even though the binaries differ from the ones "
-                         "this results directory was started with (the results "
-                         "set then mixes code versions)")
+                    help="keep the existing results even though the binaries "
+                         "differ from the ones they were measured with (the "
+                         "results set then mixes code versions); without it "
+                         "the old results are replaced")
     ap.add_argument("--settle", type=float, default=2.0,
                     help="seconds to idle before each run")
     args = ap.parse_args()
@@ -1898,7 +1905,8 @@ def main():
         # takes ~30s on 24 threads needs room for ~15 minutes.
         args.run_timeout = 1200 if args.profile in ("calibrate", "metrics") else 14400
 
-    check_toolchain_lock(root, results_dir, args.allow_toolchain_change)
+    check_toolchain_lock(root, results_dir, mesh_out_dir,
+                         args.allow_toolchain_change)
     env = write_env(root, results_dir)
     nproc = env["nproc"] or 0
     if args.threads_max > nproc:
