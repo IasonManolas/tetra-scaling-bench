@@ -116,8 +116,14 @@ def main():
     ap.add_argument("--threads-max", type=int, default=(os.cpu_count() or 24))
     ap.add_argument("--jobs", type=int, default=(os.cpu_count() or 8))
     ap.add_argument("--tbb-dir", help="directory containing TBBConfig.cmake")
-    ap.add_argument("--limit", type=int, default=30,
-                    help="prepare only the N largest surfaces (0 = all)")
+    # All surfaces get a CDT (cheap, and the only honest measure of how big a
+    # workload each one is). Mesh_3, the expensive pipeline, goes to the biggest
+    # CDTs only. Capping by surface file size is what made a 24-core run top out
+    # at 26s when a surface outside the cap would have given 67s.
+    ap.add_argument("--limit", type=int, default=0,
+                    help="consider only the N largest surface FILES (0 = all)")
+    ap.add_argument("--mesh3-limit", type=int, default=20,
+                    help="Mesh_3 partners for the N largest CDTs (0 = all)")
     ap.add_argument("--reps", type=int, default=3)
     ap.add_argument("--governor", default="performance",
                     help="CPU governor to request; 'none' to skip")
@@ -141,8 +147,10 @@ def main():
     # output meshes. Sharing those would mean the real run resumes on top of
     # smoke-run cells, mixing a throwaway measurement into the real dataset.
     if args.smoke:
-        if args.limit == 30:            # untouched default
-            args.limit = 4
+        if args.limit == 0:             # untouched default
+            args.limit = 6
+        if args.mesh3_limit == 20:
+            args.mesh3_limit = 3
         if args.budget == 12 * 3600:
             # Room for a real calibration (a single ladder rung on a fast
             # machine is ~70s) plus a sweep that actually measures something.
@@ -229,7 +237,7 @@ def main():
 
     prep = [py, SCRIPTS / "prepare_meshes.py", "--root", root,
             "--surfaces-dir", surfaces_dir, "--jobs", args.jobs,
-            "--limit", args.limit]
+            "--limit", args.limit, "--mesh3-limit", args.mesh3_limit]
     if args.smoke:
         # Mesh_3 sizing iterates; on a big surface seven rounds is minutes each.
         # A smoke run needs the pipeline exercised, not the sizing perfected --

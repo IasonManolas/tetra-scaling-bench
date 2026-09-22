@@ -302,11 +302,16 @@ def main():
     ap.add_argument("--mesh3-timeout", type=int, default=600,
                     help="per-build timeout for each Mesh_3 sizing round")
     ap.add_argument("--only", nargs="*", help="only these ids (for spot checks)")
-    ap.add_argument("--limit", type=int, default=30,
-                    help="build only the N largest surfaces (0 = all 100). The "
-                         "sweep uses roughly a dozen configs and picks the "
-                         "biggest, so building all of them mostly buys "
-                         "preprocessing time. Default 30.")
+    # Default to all of them. CDT is cheap, and it is the only way to learn
+    # which surfaces produce big tetrahedralizations -- capping this by surface
+    # file size is what made a 24-core run top out at 26s when a surface outside
+    # the cap would have given 67s.
+    ap.add_argument("--limit", type=int, default=0,
+                    help="consider only the N largest surface FILES (0 = all)")
+    ap.add_argument("--mesh3-limit", type=int, default=20,
+                    help="build Mesh_3 partners for the N largest CDTs (0 = all). "
+                         "Mesh_3 is the expensive pipeline and the sweep only "
+                         "uses about a dozen configs. Default 20.")
     ap.add_argument("--budget", type=float, default=0.0,
                     help="stop starting new surfaces after this many seconds "
                          "(0 = no limit)")
@@ -352,9 +357,16 @@ def main():
     # Biggest surfaces first: they are the ones that produce the long-running
     # configs the scaling question needs, and if the budget runs out it should
     # run out on the small ones. File size is a fine proxy for triangle count.
+    # Surface file size only orders the SURFACES, and it is a poor predictor of
+    # how big the tetrahedralization will be or how long remeshing it will take.
+    # Measured on the 24-core run: the four largest .stl files topped out at 26s
+    # at full width, while a surface left out of that selection had produced
+    # 1.19M cells and 67s in an earlier run. So this ordering decides only which
+    # surfaces to try first when a budget or --limit applies; the Mesh_3
+    # selection below ranks on the CDT's actual cell count instead.
     ids.sort(key=lambda i: found[i].stat().st_size, reverse=True)
     if args.limit and not args.only and len(ids) > args.limit:
-        print("Building the %d largest of %d surfaces (--limit 0 for all)."
+        print("Building the %d largest-file surfaces of %d (--limit 0 for all)."
               % (args.limit, len(ids)))
         ids = ids[:args.limit]
 
@@ -374,53 +386,90 @@ def main():
         manifest = json.loads(manifest_path.read_text()).get("meshes", {})
 
     t0 = time.time()
-    done = 0
     deadline = (t0 + args.budget) if args.budget else None
-    with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as pool:
-        futs = {}
-        for i in ids:
-            if deadline and time.time() > deadline:
-                print("Prep budget spent; %d surface(s) not started. Re-run to "
-                      "continue -- finished ones are skipped."
-                      % (len(ids) - len(futs)), file=sys.stderr)
-                break
-            futs[pool.submit(build_pair, bins, found[i], mesh_dir, i,
-                             pipelines, args.timeout, args.force,
-                             args.match_tol, args.max_rounds,
-                             args.mesh3_timeout)] = i
-        for fut in concurrent.futures.as_completed(futs):
-            i = futs[fut]
-            done += 1
-            try:
-                results = fut.result()
-            except Exception as e:
-                print("[%3d/%3d] %-10s EXCEPTION %s" % (done, len(futs), i, e), flush=True)
-                continue
-            for key, res in results.items():
-                if res["status"] == "ok":
-                    mp = mesh_dir / (key + ".mesh")
-                    rec = {"id": i, "key": key, "pipeline": res["pipeline"],
-                           "path": str(mp), "bytes": mp.stat().st_size,
-                           "sha256": sha256(mp), "vertices": res.get("vertices"),
-                           "cells": res.get("cells"), "source": str(found[i])}
-                    for extra in ("facet_size_rel", "probe_cells", "target_cells",
-                                  "size_match_error", "rounds", "matched",
-                                  "sizing_stopped_early"):
-                        if extra in res:
-                            rec[extra] = res[extra]
-                    manifest[key] = rec
-                    print("[%3d/%3d] %-16s ok  cells=%s%s" % (
-                        done, len(futs), key, res.get("cells"),
-                        ("  (target %s)" % res["target_cells"])
-                        if res.get("target_cells") else ""), flush=True)
-                elif res["status"] == "present":
-                    pass
-                else:
-                    manifest.pop(key, None)
-                    print("[%3d/%3d] %-16s %s%s %s" % (
-                        done, len(futs), key, res["status"],
-                        " (%s)" % res["stage"] if res.get("stage") else "",
-                        res.get("stderr", "")), flush=True)
+
+    def record(i, key, res):
+        """Fold one build's result into the manifest and print a line."""
+        if res["status"] == "ok":
+            mp = mesh_dir / (key + ".mesh")
+            rec = {"id": i, "key": key, "pipeline": res["pipeline"],
+                   "path": str(mp), "bytes": mp.stat().st_size,
+                   "sha256": sha256(mp), "vertices": res.get("vertices"),
+                   "cells": res.get("cells"), "source": str(found[i])}
+            for extra in ("facet_size_rel", "probe_cells", "target_cells",
+                          "size_match_error", "rounds", "matched",
+                          "sizing_stopped_early"):
+                if extra in res:
+                    rec[extra] = res[extra]
+            manifest[key] = rec
+            return "%-16s ok  cells=%s%s" % (
+                key, res.get("cells"),
+                ("  (target %s)" % res["target_cells"])
+                if res.get("target_cells") else "")
+        if res["status"] == "present":
+            return None
+        manifest.pop(key, None)
+        return "%-16s %s%s %s" % (key, res["status"],
+                                  " (%s)" % res["stage"] if res.get("stage") else "",
+                                  res.get("stderr", ""))
+
+    def run_batch(label, todo, fn):
+        """Run fn over todo in parallel, honouring the budget."""
+        if not todo:
+            return
+        print("\n%s: %d to build" % (label, len(todo)), flush=True)
+        done = 0
+        with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as pool:
+            futs = {}
+            for i in todo:
+                if deadline and time.time() > deadline:
+                    print("Prep budget spent; %d not started. Re-run to continue "
+                          "-- finished ones are skipped."
+                          % (len(todo) - len(futs)), file=sys.stderr)
+                    break
+                futs[pool.submit(fn, i)] = i
+            for fut in concurrent.futures.as_completed(futs):
+                i = futs[fut]
+                done += 1
+                try:
+                    results = fut.result()
+                except Exception as e:
+                    print("[%3d/%3d] %-10s EXCEPTION %s" % (done, len(futs), i, e),
+                          flush=True)
+                    continue
+                for key, res in results.items():
+                    line = record(i, key, res)
+                    if line:
+                        print("[%3d/%3d] %s" % (done, len(futs), line), flush=True)
+
+    # CDT first, for every surface. It is the cheap pipeline, and its cell count
+    # is the only honest measure of how big a workload each surface really is --
+    # which is what decides who deserves a Mesh_3 partner and what the sweep
+    # should run on.
+    if "cdt" in pipelines:
+        run_batch("CDT", ids,
+                  lambda i: build_pair(bins, found[i], mesh_dir, i, ["cdt"],
+                                       args.timeout, args.force, args.match_tol,
+                                       args.max_rounds, args.mesh3_timeout))
+
+    # Mesh_3 second, and only for the biggest CDTs. Ranking here rather than on
+    # surface file size is the whole point: Mesh_3 is by far the expensive
+    # pipeline, so it should be spent on the surfaces that actually produce long
+    # runs, not on whichever .stl files happen to be large.
+    if "mesh3" in pipelines:
+        ranked = sorted(
+            (i for i in ids if manifest.get("%s_cdt" % i, {}).get("cells")),
+            key=lambda i: manifest["%s_cdt" % i]["cells"], reverse=True)
+        if not ranked:      # cdt not requested this run; fall back to file order
+            ranked = list(ids)
+        if args.mesh3_limit and len(ranked) > args.mesh3_limit:
+            print("\nMesh_3 for the %d largest CDTs of %d (--mesh3-limit 0 for all)."
+                  % (args.mesh3_limit, len(ranked)))
+            ranked = ranked[:args.mesh3_limit]
+        run_batch("Mesh_3", ranked,
+                  lambda i: build_pair(bins, found[i], mesh_dir, i, ["mesh3"],
+                                       args.timeout, args.force, args.match_tol,
+                                       args.max_rounds, args.mesh3_timeout))
 
     ok = {k: v for k, v in manifest.items()
           if v.get("cells") and Path(v["path"]).exists()}
