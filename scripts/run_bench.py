@@ -78,6 +78,15 @@ METRICS_LOCK_CONFIGS = [("94665_cdt", 0.3), ("94665_mesh3", 0.25)]
 METRICS_DIAG_CONFIG = ("94665_cdt", 0.3)
 METRICS_DIAG_THREADS = [1, 24]
 LOCK_GRID_ENV = "CGAL_TETRAHEDRAL_REMESHING_LOCK_GRID"
+# The two knobs the 24-thread stage timings put on the table. The serial replay
+# of conflicted elements was 27.6% of a 24-thread run and its cutoff was chosen
+# at four threads; the post-split rebuild was 4.7% on one core and its interval
+# likewise. Both read their variable once per process and neither is on a
+# locking path.
+DEFERRED_ENV = "CGAL_TR_DEFERRED_CLEARED"
+METRICS_DEFERRED = [0, 25, 50, 75, 100]
+SSORT_EVERY_ENV = "CGAL_TR_SPATIAL_SORT_EVERY"
+METRICS_SSORT_EVERY = [1, 2, 3, 4]
 PERF_EVENTS = "instructions,cycles,task-clock"
 # NOT a comma, even though the request writes `-x,`. perf formats its numbers in
 # the machine's locale before joining them with the separator, so on a machine
@@ -1541,6 +1550,47 @@ def metrics_lock_grid(sweep, bins, meshes, args, common):
                              extra_env={LOCK_GRID_ENV: grid})
 
 
+def _metrics_env_sweep(sweep, bins, meshes, args, common, env, values, tag,
+                       title):
+    """One knob, swept at the widest thread count on the lock-grid configs."""
+    configs = _metrics_lookup(meshes, METRICS_LOCK_CONFIGS)
+    if not configs:
+        return
+    t = args.threads_max
+    print("\n=== %s %s at %d threads ===" % (title, values, t))
+    for rep in range(1, args.reps + 1):
+        for value in values:
+            for mesh, factor in configs:
+                _metrics_run(sweep, bins, mesh, factor, t, rep,
+                             "%s %s=%s" % (mesh["key"], tag, value), common,
+                             args, variant="%s%s" % (tag, value),
+                             extra_env={env: value})
+
+
+def metrics_deferred(sweep, bins, meshes, args, common):
+    """Sweep the deferred replay's cutoff.
+
+    The replay stops running parallel rounds once a round hands back more than
+    half of what it was given and finishes the rest on one thread. That half
+    was measured at four threads, where the serial finish is 3.7% of a run; at
+    24 threads the tails are 27.6%. 0 keeps replaying in parallel while any
+    progress is made, 100 sends every leftover to the serial form.
+    """
+    _metrics_env_sweep(sweep, bins, meshes, args, common, DEFERRED_ENV,
+                       METRICS_DEFERRED, "dc", "deferred cutoff")
+
+
+def metrics_ssort_every(sweep, bins, meshes, args, common):
+    """Sweep how often the post-split spatial rebuild runs.
+
+    It is serial -- 0.92 s on one core of a 19.34 s run at 24 threads -- but
+    the layout it restores is most of what the spatial sort is worth, so this
+    is a trade whose balance moves with the thread count.
+    """
+    _metrics_env_sweep(sweep, bins, meshes, args, common, SSORT_EVERY_ENV,
+                       METRICS_SSORT_EVERY, "ss", "spatial-sort interval")
+
+
 def metrics_diagnostics(sweep, bins, meshes, args, common, results_dir):
     """The two instrumented binaries, once each at one thread and at the widest.
 
@@ -1627,6 +1677,8 @@ def profile_metrics(sweep, bins, meshes, args, root, mesh_out_dir):
     phases = {"ladder": lambda: metrics_ladder(sweep, bins, meshes, args, common),
               "pinning": lambda: metrics_pinning(sweep, bins, meshes, args, common),
               "lockgrid": lambda: metrics_lock_grid(sweep, bins, meshes, args, common),
+              "deferred": lambda: metrics_deferred(sweep, bins, meshes, args, common),
+              "ssort": lambda: metrics_ssort_every(sweep, bins, meshes, args, common),
               "diagnostics": lambda: metrics_diagnostics(sweep, bins, meshes, args,
                                                          common, sweep.results_dir)}
     wanted = [x.strip() for x in args.metrics_phases.split(",") if x.strip()]
@@ -1775,7 +1827,7 @@ def main():
                          "docs/METRICS_REQUEST.md -- about 45 min, and it does not "
                          "calibrate, since its configurations are fixed")
     ap.add_argument("--metrics-phases",
-                    default="ladder,pinning,lockgrid,diagnostics",
+                    default="ladder,pinning,lockgrid,deferred,ssort,diagnostics",
                     help="which parts of --profile metrics to run, in order")
     ap.add_argument("--calib-budget", type=float, default=2400.0,
                     help="seconds of the full-profile budget given to calibration")
