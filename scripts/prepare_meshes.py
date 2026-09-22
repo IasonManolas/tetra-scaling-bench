@@ -15,14 +15,14 @@ them alone reports a property of the input generator as if it were a property
 of the remesher. Sizing Mesh_3 to the CDT's cell count is what makes the pair a
 controlled comparison: the two inputs differ in element quality, not in size.
 
-Input surfaces: Thingi10K ships .stl. This accepts .stl, .off and .ply and
-takes whichever it finds, so either the raw release or a repaired .off set
-works -- see --off-dir below and the README.
+Input surfaces: Thingi10K ships .stl, which is the default here. .off and .ply
+are also accepted, so a repaired/autorefined set works too -- see
+--prefer-format and the README.
 
 This step is UNTIMED and one-time. It writes manifest.json, which records each
 mesh's cell count; run_bench.py picks its subset from there.
 
-    python3 scripts/prepare_meshes.py --root work --off-dir /path/to/thingi10k
+    python3 scripts/prepare_meshes.py --root work --surfaces-dir /path/to/thingi10k
 """
 import argparse
 import concurrent.futures
@@ -273,7 +273,11 @@ def main():
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--root", default=str(REPO_ROOT / "work"))
-    ap.add_argument("--off-dir", required=True,
+    # Named --off-dir when this only took .off. Thingi10K ships .stl and that is
+    # now the default, so the old name misdescribes the argument; it stays as an
+    # alias so existing command lines keep working.
+    ap.add_argument("--surfaces-dir", "--off-dir", dest="surfaces_dir",
+                    required=True, metavar="DIR",
                     help="directory of Thingi10K surfaces (.stl, .off or .ply)")
     ap.add_argument("--prefer-format", choices=("stl", "off"), default="stl",
                     help="which to take when a model exists in both formats "
@@ -307,7 +311,7 @@ def main():
         sys.exit("Unknown pipeline(s): %s" % bad)
 
     root = Path(args.root).resolve()
-    off_dir = Path(args.off_dir).resolve()
+    surfaces_dir = Path(args.surfaces_dir).resolve()
     mesh_dir = Path(args.mesh_dir).resolve() if args.mesh_dir else root / "meshes"
     mesh_dir.mkdir(parents=True, exist_ok=True)
 
@@ -324,10 +328,10 @@ def main():
 
     ids = args.only if args.only else read_ids()
 
-    found = {i: find_surface(off_dir, i, args.prefer_format) for i in ids}
+    found = {i: find_surface(surfaces_dir, i, args.prefer_format) for i in ids}
     missing = [i for i, p in found.items() if p is None]
     if missing:
-        print("%d of %d surfaces are missing from %s" % (len(missing), len(ids), off_dir),
+        print("%d of %d surfaces are missing from %s" % (len(missing), len(ids), surfaces_dir),
               file=sys.stderr)
         print("first few: %s" % missing[:10], file=sys.stderr)
         if len(missing) == len(ids):
@@ -413,7 +417,7 @@ def main():
           if v.get("cells") and Path(v["path"]).exists()}
     manifest_path.write_text(json.dumps({
         "generated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-        "off_dir": str(off_dir),
+        "surfaces_dir": str(surfaces_dir),
         "mesh_dir": str(mesh_dir),
         "pipelines": pipelines,
         "preprocess_cdt_md5": tc["binaries"]["preprocess_cdt"]["md5"],

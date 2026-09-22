@@ -24,13 +24,27 @@ claim in this project rests on 1→4 threads. This kit exists to get numbers on 
 git clone https://github.com/IasonManolas/tetra-scaling-bench.git
 cd tetra-scaling-bench
 
-nohup python3 run_all.py --off-dir /path/to/thingi10k > run.log 2>&1 &
+# 1) smoke run first, ~30-45 min. Send back the tarball it names.
+nohup python3 run_all.py --surfaces-dir /path/to/thingi10k --smoke > smoke.log 2>&1 &
+
+# 2) once that has been checked, the real run: same command, no --smoke
+nohup python3 run_all.py --surfaces-dir /path/to/thingi10k > run.log 2>&1 &
 ```
 
-That is the whole thing: build, prepare inputs, measure (~12 h), derive quality,
-package. It checks its prerequisites and free disk **before** starting anything
-long, so it fails in seconds rather than four hours in. At the end it names one
-`work/results_*.tar.gz` — send that back.
+`--surfaces-dir` points at the Thingi10K `.stl` files (`.off` and `.ply` work too).
+
+**Do the smoke run first.** It exercises the whole path — build, both input
+pipelines, a real measurement, the quality pass, the tarball — on a handful of
+surfaces, and above all it confirms that calibration can find configurations
+that run ≥30 s at full width on *your* machine. If it cannot, we want to know
+that in 30 minutes, not 12 hours in. The smoke run writes to `smoke_results/`
+and `smoke_out_meshes/`, so it cannot contaminate the real dataset, and the
+build and prepared meshes it produces are reused by the real run.
+
+The real run is the whole thing: build, prepare inputs, measure (~12 h), derive
+quality, package. It checks its prerequisites and free disk **before** starting
+anything long, so it fails in seconds rather than four hours in. At the end it
+names one `work/results_*.tar.gz` — send that back.
 
 The machine should be otherwise idle for the measurement stage. `run_all.py`
 tries to set the CPU governor to `performance` first and tells you if it could
@@ -49,7 +63,7 @@ Useful knobs: `--budget` (measurement seconds, default 12 h), `--threads-max`,
 ```bash
 python3 scripts/setup.py --root work                     # ~15 min
 python3 scripts/prepare_meshes.py --root work \
-        --off-dir /path/to/thingi10k --jobs 24           # ~1-3 h, one time
+        --surfaces-dir /path/to/thingi10k --jobs 24           # ~1-3 h, one time
 
 nohup python3 scripts/run_bench.py --root work \
         --profile full --budget 43200 > run.log 2>&1 &   # ~12 h, unattended
@@ -107,7 +121,7 @@ actually linked TBB, and records every SHA and binary md5 in
 ### 2. Prepare the meshes (~2–4 h, one time, untimed)
 
 ```bash
-python3 scripts/prepare_meshes.py --root work --off-dir /path/to/thingi10k
+python3 scripts/prepare_meshes.py --root work --surfaces-dir /path/to/thingi10k
 ```
 
 Each surface produces **two** tetrahedral inputs:
@@ -318,7 +332,7 @@ On a machine that already has reference data:
 
 ```bash
 python3 scripts/setup.py --root work --fresh          # builds from nothing
-python3 scripts/prepare_meshes.py --root work --off-dir <off> --only 124534
+python3 scripts/prepare_meshes.py --root work --surfaces-dir <off> --only 124534
 md5sum work/meshes/124534_cdt.mesh <known-good>/124534.mesh   # must match exactly
 python3 scripts/run_bench.py --root work --profile calibrate --threads-max 4 --budget 420
 # interrupt it, re-run: it must resume and still reach the same conclusions

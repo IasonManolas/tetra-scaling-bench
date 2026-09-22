@@ -755,7 +755,11 @@ def profile_full(sweep, bins, meshes, args, root, mesh_out_dir):
     the sweep's time.
     """
     total = args.budget or 12 * 3600
-    calib_budget = min(args.calib_budget, total * 0.10)
+    # The cap is a share, not a tenth. At 10% a short run gave calibration 90s
+    # -- less than one ladder rung on a fast machine -- so it fell back before
+    # measuring anything useful. --calib-budget is the real control; this only
+    # stops calibration from eating a run whole.
+    calib_budget = min(args.calib_budget, total * 0.5)
     sweep_budget = total - calib_budget
 
     if sweep_budget < MIN_SWEEP_SECONDS:
