@@ -4,6 +4,23 @@ Everything you need, in the order you need it. You should not have to ask us
 anything; if a step does not behave as described here, that is a bug in the kit
 and worth telling us about.
 
+## What is being measured
+
+The kit builds the remesher from **`IasonManolas/cgal` @ `scale24`** — tip
+`4cc06258243` when this was written — and compares it against upstream
+`CGAL/cgal` @ `main`. The `seq` and `par` arms are one binary built from that
+one tree; they differ by concurrency tag, not by branch.
+
+> **Two things moved on 2026-09-22.** The branch under test changed from
+> `gsoc2026-Tetra_remeshing_parallel-imanolas` to `scale24`, which is that
+> branch plus the three commits the scaling measurements need. And the kit
+> itself gained `instructions`, `cycles` and `task_clock_ms` columns and the
+> metrics run. **A `git pull` on your `main` brings both.** So a results
+> tarball you produced before that date measured a different branch with a
+> narrower results table, and the two are not comparable — do not merge them.
+> If you are unsure which you are holding, `toolchain_lock.json` inside the
+> tarball names the branch and the commit it was built from.
+
 There are three runs in the kit, and they are separate things:
 
 | run | what it is for | roughly |
@@ -91,6 +108,39 @@ the directory holding `TBBConfig.cmake` as `--tbb-dir`.
 
 The build checks afterwards that `bench_remesh` really linked TBB and stops if
 it did not, so a silently TBB-less binary cannot reach a measurement.
+
+### Testing a branch that is not pushed yet
+
+`setup.py` normally clones `scale24` from GitHub. To build against a checkout
+already on your disk instead — a branch still under review, or a local fix you
+want to measure before pushing it — point `--ours-dir` at it and run `setup.py`
+by hand before `run_all.py`:
+
+```bash
+export LD_LIBRARY_PATH=/opt/intel/oneapi/2025.2/lib/intel64/gcc4.8:$LD_LIBRARY_PATH
+python3 scripts/setup.py --root ~/tetra-bench-work \
+    --ours-dir /path/to/your/cgal/checkout \
+    --tbb-dir /opt/intel/oneapi/2025.2/lib/cmake/tbb \
+    --diagnostics --skip-main
+```
+
+Three things worth knowing about that command:
+
+- `--ours-dir` takes the **root of a CGAL source tree** (the directory holding
+  `CGALConfig.cmake`), not a build directory. Nothing is fetched and nothing in
+  it is modified; it is read.
+- `--skip-main` omits the upstream reference arm, so you do not also need a
+  CGAL `main` checkout. `--profile metrics` never uses that arm. The full sweep
+  does, so do not use `--skip-main` for a real sweep.
+- `--diagnostics` builds the two instrumented binaries. Leave it off if you are
+  not running the metrics mode.
+
+The `LD_LIBRARY_PATH` line matters if your TBB came from oneAPI rather than
+from the distribution: without it the binaries link but fail to start, with a
+message about `libtbb.so.12` not being found. Export it in the same shell you
+then run `run_all.py` from.
+
+`run_all.py` afterwards reuses whatever `setup.py` built; it does not re-clone.
 
 ### Memory and disk
 

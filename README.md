@@ -6,8 +6,19 @@ to mesh quality, comparing three things:
 | arm | tree | concurrency | threads |
 |---|---|---|---|
 | `main` | `CGAL/cgal` @ `main` | sequential (upstream has no concurrency tag) | 1 |
-| `seq` | `IasonManolas/cgal` @ `gsoc2026-Tetra_remeshing_parallel-imanolas` | `CGAL::Sequential_tag` | 1 |
-| `par` | same branch | `CGAL::Parallel_tag` | 1, 2, 4, 8, 12, 16, 24 |
+| `seq` | `IasonManolas/cgal` @ `scale24` | `CGAL::Sequential_tag` | 1 |
+| `par` | same branch, same commit | `CGAL::Parallel_tag` | 1, 2, 4, 8, 12, 16, 24 |
+
+`seq` and `par` are one binary built from one tree; they differ by
+concurrency tag alone, so they always move together.
+
+> **The branch under test changed on 2026-09-22**, from
+> `gsoc2026-Tetra_remeshing_parallel-imanolas` to `scale24` — the same branch
+> plus the three commits the scaling measurements need, tip `4cc06258243` at
+> the time of writing. **A results tarball produced before that date measured
+> the older branch**, and the two are not interchangeable. Every results set
+> records the commit it was built from in `env.json` and in
+> `toolchain_lock.json`, so which one you are holding is always answerable.
 
 `par@1` is measured deliberately: it is the only way to tell "the parallel
 algorithm costs something even on one thread" apart from "it does not scale".
@@ -207,14 +218,13 @@ scaling analysis does not read — the edge-factor ladder, the extra meshes, and
 the `seq` and `main` reference arms, which run at one thread by definition and
 so cannot move with anything tested here.
 
-> **Two of the four phases need code that is not on the target branch yet.**
-> `setup.py` clones `gsoc2026-Tetra_remeshing_parallel-imanolas` from GitHub, and
-> at `bd32d445baa` that branch carries `CGAL_TR_LOCKCOUNT` but neither
-> `CGAL_TR_TOPSTAGE` nor the `CGAL_TETRAHEDRAL_REMESHING_LOCK_GRID` environment
-> variable. Until both are pushed, the lock-grid sweep measures the same build
-> five times over and the stage-timing binary prints nothing. Neither failure
-> announces itself in the log — the lock-grid table simply comes back flat, and
-> the empty stdout capture is what the checklist in RUNNING.md §7 catches.
+> **Resolved 2026-09-22.** Two of these four phases need code that was not on
+> the target branch when they were written: `CGAL_TR_TOPSTAGE` and the
+> `CGAL_TETRAHEDRAL_REMESHING_LOCK_GRID` override. Both are now on `scale24`,
+> which is the branch `setup.py` fetches, so all four phases measure what they
+> claim to. If you ever point the kit at a branch that lacks them, the failure
+> is silent in the log — the lock-grid table comes back flat and the stage-timing
+> capture is empty — and the checklist in RUNNING.md §7 is what catches it.
 
 Like `--smoke`, it writes to its own directories (`metrics_results/`,
 `metrics_out_meshes/`) and shares the build and prepared meshes with the real

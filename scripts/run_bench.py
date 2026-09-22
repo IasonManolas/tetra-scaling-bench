@@ -157,7 +157,12 @@ def check_toolchain_lock(root, results_dir, allow_change):
     must match.
     """
     tc = json.loads((root / "toolchain.json").read_text())
+    # The ref names are recorded as well as the commits. A SHA alone cannot say
+    # WHICH branch was measured, and the branch under test has moved once
+    # already (to scale24, 2026-09-22); a results set that does not name it
+    # leaves anyone holding the tarball guessing.
     now = {"ours_sha": tc.get("ours_sha"), "main_sha": tc.get("main_sha"),
+           "ours_ref": tc.get("ours_ref"), "main_ref": tc.get("main_ref"),
            "binaries": {n: v.get("md5") for n, v in tc.get("binaries", {}).items()}}
 
     lock_path = results_dir / "toolchain_lock.json"
@@ -166,16 +171,20 @@ def check_toolchain_lock(root, results_dir, allow_change):
         return
 
     was = json.loads(lock_path.read_text())
-    if was == now:
+    # Compare only what the stored lock actually recorded. A lock written before
+    # the ref names were added must not read as "the branch changed" merely
+    # because it does not mention one -- that would refuse a resume which is in
+    # fact perfectly consistent. Anything it did record is compared strictly.
+    if all(was.get(k) == now.get(k) for k in was):
         return
 
     diffs = []
-    for k in ("ours_sha", "main_sha"):
-        if was.get(k) != now.get(k):
-            diffs.append("  %-9s %s -> %s" % (k, (was.get(k) or "?")[:12],
-                                              (now.get(k) or "?")[:12]))
+    for k in ("ours_ref", "ours_sha", "main_ref", "main_sha"):
+        if k in was and was.get(k) != now.get(k):
+            diffs.append("  %-9s %s -> %s" % (k, str(was.get(k))[:40],
+                                              str(now.get(k))[:40]))
     for n, md5 in sorted(now["binaries"].items()):
-        if was["binaries"].get(n) != md5:
+        if n in was.get("binaries", {}) and was["binaries"].get(n) != md5:
             diffs.append("  %-9s %s rebuilt" % ("binary", n))
 
     msg = ("The code changed since this results directory was started:\n%s\n"
