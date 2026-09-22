@@ -377,16 +377,40 @@ def core_sets(n=None):
     cores are all the same the two groups coincide, and the caller is told so by
     getting the same list twice.
     """
-    freqs = cpu_max_freqs_khz()
+    fast, slow = split_core_tiers(cpu_max_freqs_khz())
+    if n:
+        fast, slow = fast[:n], slow[:n]
+    return fast, slow
+
+
+def split_core_tiers(freqs):
+    """Split CPUs into a fast and a slow set at the widest gap in their clocks.
+
+    Taking only the single highest clock as "the performance cores" is wrong on
+    a part that boosts a couple of favoured cores above the rest of their own
+    kind. Measured on the Core Ultra 9 285 this kit runs on: 2 CPUs at 5.6 GHz,
+    6 more at 5.4 and 16 E-cores at 4.7. The highest group there is TWO CPUs, so
+    the 8-thread pinned arm would have put eight threads on two cores and
+    reported the oversubscription as a placement effect.
+
+    The kinds of core are separated by a much wider gap than the boost bins
+    inside one kind (13% against 3.6% above), so the split goes at the widest
+    relative gap between adjacent clock tiers. A machine with one tier gets the
+    same list twice, which is how the caller is told there is nothing to pin.
+    """
     if not freqs:
         return [], []
     groups = {}
     for cpu, f in freqs.items():
-        groups.setdefault(f, []).append(cpu)
-    fast = sorted(groups[max(groups)])
-    slow = sorted(groups[min(groups)])
-    if n:
-        fast, slow = fast[:n], slow[:n]
+        groups.setdefault(int(f), []).append(int(cpu))
+    tiers = sorted(groups, reverse=True)
+    if len(tiers) == 1:
+        only = sorted(groups[tiers[0]])
+        return only, only
+    # The widest relative step between neighbouring tiers is the kind boundary.
+    cut = max(range(len(tiers) - 1), key=lambda i: (tiers[i] - tiers[i + 1]) / tiers[i])
+    fast = sorted(c for t in tiers[:cut + 1] for c in groups[t])
+    slow = sorted(c for t in tiers[cut + 1:] for c in groups[t])
     return fast, slow
 
 
