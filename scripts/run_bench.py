@@ -110,6 +110,12 @@ CSV_HEADER = ["mesh", "factor", "arm", "threads", "rep", "wall_s", "remesh_s",
               # busy_freq_* columns instead.
               "busy_freq_mean_mhz", "busy_freq_min_mhz", "busy_freq_max_mhz",
               "busy_freq_samples",
+              # Thermal-throttle entries during this cell. It was dropped from
+              # this list when the busy_freq_* block was added, while run_cell
+              # went on recording it -- DictWriter ignores a field the header
+              # does not name, so the column vanished silently and report.py's
+              # throttling check read None for every row.
+              "throttle_events",
               # Work, as opposed to CPU seconds. user_s moves with the clock --
               # the same binary on the same input measured +44.6% CPU seconds
               # from 1 to 4 threads but only +17.1% instructions -- so it
