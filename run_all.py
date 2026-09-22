@@ -233,8 +233,10 @@ def main():
     if args.smoke:
         # Mesh_3 sizing iterates; on a big surface seven rounds is minutes each.
         # A smoke run needs the pipeline exercised, not the sizing perfected --
-        # the real run re-does any pair that is still off target.
-        prep += ["--max-rounds", 3]
+        # the real run re-does any pair that is still off target. The tighter
+        # Mesh_3 timeout matters more than the round cap: some Thingi surfaces
+        # make Mesh_3 crawl, and a smoke run must not stall on one of them.
+        prep += ["--max-rounds", 3, "--mesh3-timeout", 180]
     stage("2-prepare", prep, log_dir, args.dry_run)
 
     if args.governor and args.governor != "none" and not args.dry_run:

@@ -219,7 +219,7 @@ def preprocess_mesh3(exe, src, mesh_path, target_cells, timeout,
 
 
 def build_pair(bins, src, mesh_dir, mesh_id, pipelines, timeout, force,
-               tol=MATCH_TOL, max_rounds=MAX_ROUNDS):
+               tol=MATCH_TOL, max_rounds=MAX_ROUNDS, mesh3_timeout=None):
     """One surface -> up to two .mesh inputs. Returns {key: record}.
 
     The mesh3 build needs the cdt cell count as its target, so when both are
@@ -250,8 +250,8 @@ def build_pair(bins, src, mesh_dir, mesh_id, pipelines, timeout, force,
             if cdt_cells is None and cdt_path.exists():
                 cdt_cells = _cells_from_medit(cdt_path)
             out["%s_mesh3" % mesh_id] = preprocess_mesh3(
-                bins["preprocess_mesh3"], src, m3_path, cdt_cells, timeout,
-                tol, max_rounds)
+                bins["preprocess_mesh3"], src, m3_path, cdt_cells,
+                mesh3_timeout or timeout, tol, max_rounds)
     return out
 
 
@@ -292,7 +292,15 @@ def main():
                     help="which input generators to build: cdt, mesh3, or both")
     ap.add_argument("--jobs", type=int, default=max(1, (os.cpu_count() or 4) // 2))
     ap.add_argument("--timeout", type=int, default=3600,
-                    help="per-build timeout in seconds")
+                    help="per-build timeout in seconds, for the CDT stage")
+    # Mesh_3 gets its own, much shorter limit. It is run up to --max-rounds
+    # times per surface, so a shared 1-hour timeout means one pathological
+    # surface can stall preprocessing for hours -- observed: a coarse probe
+    # that should take seconds hitting the full 3600s. A Mesh_3 build that has
+    # not finished in a few minutes at probe size is not going to produce a
+    # usable matched pair, and the CDT input for that surface is unaffected.
+    ap.add_argument("--mesh3-timeout", type=int, default=600,
+                    help="per-build timeout for each Mesh_3 sizing round")
     ap.add_argument("--only", nargs="*", help="only these ids (for spot checks)")
     ap.add_argument("--limit", type=int, default=30,
                     help="build only the N largest surfaces (0 = all 100). The "
@@ -378,7 +386,8 @@ def main():
                 break
             futs[pool.submit(build_pair, bins, found[i], mesh_dir, i,
                              pipelines, args.timeout, args.force,
-                             args.match_tol, args.max_rounds)] = i
+                             args.match_tol, args.max_rounds,
+                             args.mesh3_timeout)] = i
         for fut in concurrent.futures.as_completed(futs):
             i = futs[fut]
             done += 1
