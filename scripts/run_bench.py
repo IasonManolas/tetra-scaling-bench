@@ -41,6 +41,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -67,7 +68,17 @@ THREAD_LIST = [1, 2, 4, 8, 12, 16, 24]
 # a timestamp there is no way to tell a real effect from thermal drift after
 # the fact, and no way to re-measure only the suspect rows.
 CSV_HEADER = ["mesh", "factor", "arm", "threads", "rep", "wall_s", "remesh_s",
-              "peak_rss_kb", "rc", "timed_out", "started_at", "out_mesh", "json"]
+              "peak_rss_kb", "rc", "timed_out", "started_at",
+              # How the machine behaved while this ran. avg_parallelism is CPU
+              # time over wall time -- the cores actually working -- and the
+              # frequency and throttle columns say whether the clocks held up.
+              # A low speedup with avg_parallelism near the thread count is the
+              # algorithm; near 1 it never went parallel; falling clocks or
+              # rising throttle_events mean the machine, not the code.
+              "user_s", "sys_s", "cpu_pct", "avg_parallelism",
+              "freq_mean_mhz", "freq_min_mhz", "freq_max_mhz", "freq_samples",
+              "throttle_events",
+              "out_mesh", "json"]
 
 
 # --------------------------------------------------------------------------
@@ -80,6 +91,64 @@ def capture(cmd):
                               timeout=30).stdout.strip()
     except Exception:
         return ""
+
+
+def _read_first(rel):
+    """One small sysfs value under /sys/devices/system/cpu, or ''."""
+    try:
+        return (CPU_ROOT / rel).read_text().strip()
+    except Exception:
+        return ""
+
+
+def check_toolchain_lock(root, results_dir, allow_change):
+    """Refuse to extend a results set that was measured with different binaries.
+
+    setup.py fetches the branch tip every time it runs, which is what you want
+    when starting, and exactly what you do not want on a resume: an interrupted
+    12-hour run restarted after a push would rebuild, and the remaining cells
+    would be measured against different code and appended to the same CSV. The
+    SHAs live in env.json, which is rewritten each invocation, so afterwards
+    there would be nothing to reveal the mixture.
+
+    The first sweep into a results directory records what it used; later ones
+    must match.
+    """
+    tc = json.loads((root / "toolchain.json").read_text())
+    now = {"ours_sha": tc.get("ours_sha"), "main_sha": tc.get("main_sha"),
+           "binaries": {n: v.get("md5") for n, v in tc.get("binaries", {}).items()}}
+
+    lock_path = results_dir / "toolchain_lock.json"
+    if not lock_path.exists():
+        lock_path.write_text(json.dumps(now, indent=2))
+        return
+
+    was = json.loads(lock_path.read_text())
+    if was == now:
+        return
+
+    diffs = []
+    for k in ("ours_sha", "main_sha"):
+        if was.get(k) != now.get(k):
+            diffs.append("  %-9s %s -> %s" % (k, (was.get(k) or "?")[:12],
+                                              (now.get(k) or "?")[:12]))
+    for n, md5 in sorted(now["binaries"].items()):
+        if was["binaries"].get(n) != md5:
+            diffs.append("  %-9s %s rebuilt" % ("binary", n))
+
+    msg = ("The code changed since this results directory was started:\n%s\n"
+           % "\n".join(diffs))
+    if not allow_change:
+        sys.exit(msg +
+                 "\nContinuing would append cells measured with different binaries to\n"
+                 "the same results.csv, and nothing in the output would show it.\n"
+                 "Either:\n"
+                 "  - start a fresh results directory (--results-dir), or\n"
+                 "  - rebuild the original commit and re-run, or\n"
+                 "  - pass --allow-toolchain-change if you really mean to mix them.")
+    print(msg + "Continuing because --allow-toolchain-change was given; the\n"
+          "results set now mixes binaries.", file=sys.stderr)
+    lock_path.write_text(json.dumps(now, indent=2))
 
 
 def write_env(root, results_dir):
@@ -99,6 +168,16 @@ def write_env(root, results_dir):
         "python": sys.version.split()[0],
         "nproc": os.cpu_count(),
         "cpu_governor": governor,
+        # The driver matters more than the governor name. Under intel_pstate,
+        # 'powersave' is the normal default and still boosts to full turbo -- it
+        # is not the old ondemand-style throttling, and warning about it misleads.
+        "cpufreq_driver": _read_first("cpu0/cpufreq/scaling_driver"),
+        "cpufreq_max_khz": _read_first("cpu0/cpufreq/cpuinfo_max_freq"),
+        "cpufreq_min_khz": _read_first("cpu0/cpufreq/cpuinfo_min_freq"),
+        # 1 here means turbo is disabled outright, which caps every thread count
+        # at base clock and would look exactly like poor scaling.
+        "no_turbo": _read_first("intel_pstate/no_turbo"),
+        "throttle_events_at_start": _read_throttle_counts(),
         "lscpu": capture(["lscpu"]),
         "numactl": capture(["numactl", "--hardware"]),
         "meminfo": capture(["head", "-3", "/proc/meminfo"]),
@@ -158,6 +237,79 @@ def _kill_group(proc):
         print("Warning: process group %d did not die; later timings may be\n"
               "         contaminated. Check for stray bench_remesh processes."
               % pgid, file=sys.stderr)
+
+
+CPU_ROOT = Path("/sys/devices/system/cpu")
+
+
+def _read_throttle_counts():
+    """Total thermal-throttle events across cores, or None if unavailable.
+
+    A rising count during a run is the machine telling us it cut clocks to stay
+    within thermal or power limits. That is the difference between 'this code
+    does not scale' and 'this machine could not sustain the clocks', and the two
+    have completely different answers.
+    """
+    # core_throttle_count only. Adding package_throttle_count to it sums two
+    # different things and inflates the magnitude into something that looks
+    # alarming but means nothing. Even here the magnitude is only a count of
+    # throttle ENTRIES, not of severity -- what matters is whether the delta
+    # across a run is zero or not.
+    total = 0
+    found = False
+    for p in CPU_ROOT.glob("cpu*/thermal_throttle/core_throttle_count"):
+        try:
+            total += int(p.read_text().strip())
+            found = True
+        except Exception:
+            pass
+    return total if found else None
+
+
+def _read_freqs_khz():
+    """Current clock of every core, in kHz."""
+    out = []
+    for p in CPU_ROOT.glob("cpu[0-9]*/cpufreq/scaling_cur_freq"):
+        try:
+            out.append(int(p.read_text().strip()))
+        except Exception:
+            pass
+    return out
+
+
+class _FreqSampler(threading.Thread):
+    """Samples aggregate CPU clock while a measurement runs.
+
+    Deliberately light: a handful of small sysfs reads on a 2s period, on one
+    thread, against a job that is saturating every core for tens of seconds.
+    """
+
+    def __init__(self, period=2.0):
+        super().__init__(daemon=True)
+        self.period = period
+        # NOT self._stop: Thread._stop() is an internal method that join()
+        # calls, and shadowing it with an Event makes join() raise
+        # "'Event' object is not callable".
+        self._stop_evt = threading.Event()
+        self.samples = []      # mean MHz across cores, per sample
+
+    def run(self):
+        while not self._stop_evt.is_set():
+            f = _read_freqs_khz()
+            if f:
+                self.samples.append(sum(f) / len(f) / 1000.0)
+            self._stop_evt.wait(self.period)
+
+    def stop(self):
+        self._stop_evt.set()
+        self.join(timeout=5)
+        if not self.samples:
+            return {}
+        s = sorted(self.samples)
+        return {"freq_mean_mhz": round(sum(s) / len(s), 1),
+                "freq_min_mhz": round(s[0], 1),
+                "freq_max_mhz": round(s[-1], 1),
+                "freq_samples": len(s)}
 
 
 def run_cell(bins, mesh_path, factor, arm, threads, rep, results_dir,
@@ -224,7 +376,11 @@ def run_cell(bins, mesh_path, factor, arm, threads, rep, results_dir,
     rss_file.unlink(missing_ok=True)
     wrapped = cmd
     if shutil.which("/usr/bin/time"):
-        wrapped = ["/usr/bin/time", "-f", "%e %M", "-o", str(rss_file)] + cmd
+        # %U and %S give CPU time, and CPU time over wall time is the average
+        # number of cores actually working. Without it, a low speedup cannot be
+        # told apart from the job simply not using the cores it was given.
+        wrapped = ["/usr/bin/time", "-f", "%e %M %U %S %P",
+                   "-o", str(rss_file)] + cmd
 
     # The whole run goes in its own process group, and a timeout kills the
     # GROUP. subprocess.run(timeout=...) only kills its direct child, which
@@ -233,6 +389,13 @@ def run_cell(bins, mesh_path, factor, arm, threads, rep, results_dir,
     # hypothetical: a 24-core run recorded three cells as 240s timeouts whose
     # JSONs said "success" at 259s, and the two measurements that followed came
     # out 8% slow because an orphan was still running beside them.
+    try:
+        throttle_before = _read_throttle_counts()
+        sampler = _FreqSampler()
+        sampler.start()
+    except Exception:
+        throttle_before, sampler = None, _FreqSampler()
+
     t0 = time.time()
     started_at = time.strftime("%Y-%m-%dT%H:%M:%S")
     timed_out = False
@@ -247,12 +410,42 @@ def run_cell(bins, mesh_path, factor, arm, threads, rep, results_dir,
             rc = proc.returncode if proc.returncode is not None else -9
     wall = time.time() - t0
 
-    peak_rss = ""
+    # Instrumentation must never cost a measurement. A 12-hour unattended run
+    # losing a cell because a sysfs read misbehaved would be a bad trade for
+    # diagnostics, so anything that goes wrong here is simply absent data.
+    try:
+        freq = sampler.stop()
+    except Exception:
+        freq = {}
+    try:
+        throttle_after = _read_throttle_counts()
+        throttled = ("" if throttle_before is None or throttle_after is None
+                     else throttle_after - throttle_before)
+    except Exception:
+        throttled = ""
+
+    peak_rss, user_s, sys_s, cpu_pct = "", "", "", ""
     if rss_file.exists():
         try:
-            peak_rss = rss_file.read_text().split()[-1]
+            parts = rss_file.read_text().split()
+            # "%e %M %U %S %P" -> elapsed, maxrss, user, sys, cpu%
+            if len(parts) >= 5:
+                peak_rss, user_s, sys_s = parts[1], parts[2], parts[3]
+                cpu_pct = parts[4].rstrip("%")
+            elif parts:
+                peak_rss = parts[-1]
         except Exception:
             pass
+
+    # CPU time over wall time: the average number of cores actually working.
+    # This is the number that separates "does not scale" from "never used the
+    # cores", and it needs no trust in the scheduler or the governor.
+    avg_par = ""
+    try:
+        if user_s and sys_s and wall > 0:
+            avg_par = round((float(user_s) + float(sys_s)) / wall, 2)
+    except Exception:
+        pass
 
     if timed_out:
         # Leave nothing behind that a later run would mistake for a finished
@@ -273,11 +466,15 @@ def run_cell(bins, mesh_path, factor, arm, threads, rep, results_dir,
         except Exception:
             pass
 
-    return {"mesh": mesh_id, "factor": factor, "arm": arm, "threads": threads,
-            "rep": rep, "wall_s": round(wall, 3), "remesh_s": remesh_s,
-            "peak_rss_kb": peak_rss, "rc": rc, "timed_out": int(timed_out),
-            "started_at": started_at,
-            "out_mesh": "" if timed_out else out_mesh, "json": str(json_path)}
+    row = {"mesh": mesh_id, "factor": factor, "arm": arm, "threads": threads,
+           "rep": rep, "wall_s": round(wall, 3), "remesh_s": remesh_s,
+           "peak_rss_kb": peak_rss, "rc": rc, "timed_out": int(timed_out),
+           "started_at": started_at, "user_s": user_s, "sys_s": sys_s,
+           "cpu_pct": cpu_pct, "avg_parallelism": avg_par,
+           "throttle_events": throttled,
+           "out_mesh": "" if timed_out else out_mesh, "json": str(json_path)}
+    row.update(freq)
+    return row
 
 
 class Sweep:
@@ -825,7 +1022,8 @@ def package(results_dir, root, mesh_out_dir=None):
     import tarfile
     out = root / ("results_%s_%s.tar.gz" % (platform.node(),
                                             time.strftime("%Y%m%d-%H%M")))
-    wanted = ["results.csv", "env.json", "calibration.json", "json", "quality"]
+    wanted = ["results.csv", "env.json", "calibration.json",
+              "toolchain_lock.json", "json", "quality"]
     try:
         with tarfile.open(out, "w:gz") as tf:
             for name in wanted:
@@ -958,6 +1156,10 @@ def main():
     ap.add_argument("--run-timeout", type=int, default=None,
                     help="per-run timeout in seconds "
                          "(default 240 for calibrate, 7200 for overnight)")
+    ap.add_argument("--allow-toolchain-change", action="store_true",
+                    help="continue even though the binaries differ from the ones "
+                         "this results directory was started with (the results "
+                         "set then mixes code versions)")
     ap.add_argument("--settle", type=float, default=2.0,
                     help="seconds to idle before each run")
     args = ap.parse_args()
@@ -991,15 +1193,23 @@ def main():
         # takes ~30s on 24 threads needs room for ~15 minutes.
         args.run_timeout = 1200 if args.profile == "calibrate" else 14400
 
+    check_toolchain_lock(root, results_dir, args.allow_toolchain_change)
     env = write_env(root, results_dir)
     nproc = env["nproc"] or 0
     if args.threads_max > nproc:
         print("Warning: --threads-max %d exceeds nproc %d; oversubscribing."
               % (args.threads_max, nproc), file=sys.stderr)
-    if env["cpu_governor"] and env["cpu_governor"] != "performance":
-        print("Warning: CPU governor is '%s', not 'performance'. Timings will be\n"
+    # Only warn when it actually means something. Under intel_pstate,
+    # 'powersave' is the stock default and still reaches full turbo; warning
+    # about it sends people chasing a non-problem.
+    gov, drv = env.get("cpu_governor", ""), env.get("cpufreq_driver", "")
+    if gov and gov != "performance" and drv != "intel_pstate":
+        print("Warning: CPU governor is '%s' with driver '%s'. Timings will be\n"
               "         noisier and low thread counts will look worse than they are."
-              % env["cpu_governor"], file=sys.stderr)
+              % (gov, drv or "unknown"), file=sys.stderr)
+    if env.get("no_turbo") == "1":
+        print("Warning: turbo is DISABLED (intel_pstate/no_turbo=1). Every thread\n"
+              "         count is capped at base clock.", file=sys.stderr)
 
     pipes = [p.strip() for p in args.pipelines.split(",") if p.strip()] \
         if args.pipelines else None

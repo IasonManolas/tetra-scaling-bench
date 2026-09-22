@@ -46,6 +46,11 @@ def load_rows(results_dir):
                 r["timed_out"] = int(r["timed_out"])
                 r["peak_rss_kb"] = int(r["peak_rss_kb"]) if r["peak_rss_kb"] else None
                 r["remesh_s"] = float(r["remesh_s"]) if r["remesh_s"] else None
+                for k in ("avg_parallelism", "freq_mean_mhz", "freq_min_mhz",
+                          "freq_max_mhz", "user_s", "sys_s"):
+                    r[k] = float(r[k]) if r.get(k) else None
+                r["throttle_events"] = (int(r["throttle_events"])
+                                        if r.get("throttle_events") else None)
             except Exception:
                 continue
 
@@ -132,6 +137,10 @@ def aggregate(rows):
                 "cell_edge_median", "edge_conformance")},
             "cells_in": best.get("cells_in"),
             "target_edge_length": best.get("target_edge_length"),
+            "avg_parallelism": best.get("avg_parallelism"),
+            "freq_mean_mhz": best.get("freq_mean_mhz"),
+            "freq_min_mhz": best.get("freq_min_mhz"),
+            "throttle_events": max((r.get("throttle_events") or 0) for r in rs) or None,
         }
     return agg
 
@@ -161,17 +170,27 @@ def section_env(results_dir, out):
     out.append("|---|---|")
     out.append("| host | `%s` |" % env.get("hostname"))
     out.append("| nproc | %s |" % env.get("nproc"))
-    out.append("| governor | %s |" % (env.get("cpu_governor") or "unknown"))
+    out.append("| governor | %s (driver %s) |" % (env.get("cpu_governor") or "unknown",
+                                                  env.get("cpufreq_driver") or "unknown"))
+    if env.get("cpufreq_max_khz"):
+        out.append("| clock range | %.0f - %.0f MHz |"
+                   % (float(env["cpufreq_min_khz"]) / 1000,
+                      float(env["cpufreq_max_khz"]) / 1000))
     out.append("| platform | %s |" % env.get("platform"))
     tc = env.get("toolchain", {})
     out.append("| ours | `%s` @ `%s` |" % (tc.get("ours_ref"), (tc.get("ours_sha") or "")[:12]))
     out.append("| main | `%s` @ `%s` |" % (tc.get("main_ref"), (tc.get("main_sha") or "")[:12]))
     out.append("")
-    gov = env.get("cpu_governor")
-    if gov and gov != "performance":
-        out.append("> The CPU governor was `%s`, not `performance`. Low thread counts "
+    # Only flag the governor when it can actually matter. Under intel_pstate,
+    # 'powersave' is the stock default and still reaches full turbo.
+    gov, drv = env.get("cpu_governor"), env.get("cpufreq_driver")
+    if gov and gov != "performance" and drv != "intel_pstate":
+        out.append("> The CPU governor was `%s` with driver `%s`. Low thread counts "
                    "look worse than they are under a scaling governor, so the speedup "
-                   "numbers below are, if anything, optimistic.\n" % gov)
+                   "numbers below are, if anything, optimistic.\n" % (gov, drv or "?"))
+    if env.get("no_turbo") == "1":
+        out.append("> **Turbo was disabled** on this machine, so every thread count "
+                   "ran at base clock.\n")
 
 
 def section_scaling(agg, out, threads_max):
@@ -280,6 +299,79 @@ def section_totals(agg, out, threads_max):
         out.append("_%d of %d configs are excluded from this table because not "
                    "every arm covers them; they still appear per-config above._\n"
                    % (len(all_configs) - len(common), len(all_configs)))
+
+
+def section_machine_behaviour(agg, out):
+    """Why the speedup is what it is: the code, or the machine?
+
+    A speedup well below the thread count has three very different causes, and
+    wall time alone cannot tell them apart:
+
+      - avg_parallelism near the thread count, clocks steady
+            -> the cores were used and held their speed. The shortfall is the
+               algorithm. This is the finding the benchmark exists to produce.
+      - avg_parallelism far below the thread count
+            -> the work never went parallel: serial sections, lock contention,
+               or threads starved. Not a clock problem.
+      - clocks falling as threads rise, or throttle_events rising
+            -> the machine could not sustain the frequency. All-core turbo is
+               always below single-core turbo, so SOME drop is normal and
+               expected; throttle events are not.
+    """
+    rows = [(k, a) for k, a in agg.items() if k[2] == "par"
+            and a.get("avg_parallelism")]
+    if not rows:
+        return
+
+    out.append("## Cores actually used, and clocks held\n")
+    out.append("`used` is CPU time over wall time — the average number of cores "
+               "genuinely working. `eff` is `used` over the threads requested: "
+               "high `eff` with low speedup means the cores were busy but not "
+               "productive, low `eff` means they were never taken. Some clock "
+               "drop as threads rise is normal, since all-core turbo sits below "
+               "single-core turbo. `throttle` counts throttle entries during the "
+               "run — the magnitude is not a severity, but anything above 0 "
+               "means the machine was cutting clocks.\n")
+    out.append("| config | threads | wall (s) | used | eff | clock mean (MHz) | clock min | throttle |")
+    out.append("|---|---:|---:|---:|---:|---:|---:|---:|")
+
+    for k, a in sorted(rows, key=lambda kv: (kv[0][0], kv[0][1], kv[0][3])):
+        mesh, factor, _, t = k
+        used = a["avg_parallelism"]
+        out.append("| %s f=%s | %d | %s | %s | %s | %s | %s | %s |" % (
+            mesh, factor, t, fmt(a["median_wall"], "%.1f"), fmt(used, "%.1f"),
+            fmt(100.0 * used / t if t else None, "%.0f%%") if used else "-",
+            fmt(a.get("freq_mean_mhz"), "%.0f"), fmt(a.get("freq_min_mhz"), "%.0f"),
+            a.get("throttle_events") if a.get("throttle_events") is not None else "-"))
+    out.append("")
+
+    # Say the conclusion rather than leaving it in the table.
+    worst = None
+    for k, a in rows:
+        t = k[3]
+        if t and t > 1:
+            e = a["avg_parallelism"] / t
+            if worst is None or e < worst[0]:
+                worst = (e, k, a)
+    throttled = [k for k, a in rows if (a.get("throttle_events") or 0) > 0]
+
+    if throttled:
+        out.append("> **The machine throttled** during %d configuration(s), so "
+                   "some of the shortfall is thermal or power limiting rather "
+                   "than the code. Those rows cannot be read as scaling results.\n"
+                   % len(throttled))
+    if worst and worst[0] < 0.6:
+        e, k, a = worst
+        out.append("> At %d threads on `%s f=%s`, only **%.1f of %d cores** were "
+                   "working on average (%.0f%%). The cores were available and "
+                   "were not taken, so this is the algorithm — serial sections, "
+                   "contention or starvation — not clock behaviour.\n"
+                   % (k[3], k[0], k[1], a["avg_parallelism"], k[3], 100 * e))
+    elif worst and worst[0] >= 0.8 and not throttled:
+        out.append("> Cores were used well (worst case %.0f%% of the threads "
+                   "requested) and no throttling was recorded, so the speedup "
+                   "shortfall is real algorithmic scaling, not the machine.\n"
+                   % (100 * worst[0]))
 
 
 def load_manifest(results_dir, explicit=None):
@@ -568,6 +660,7 @@ def main():
     section_env(results_dir, out)
     section_scaling(agg, out, threads_max)
     section_totals(agg, out, threads_max)
+    section_machine_behaviour(agg, out)
     section_pipelines(agg, rows, out, load_manifest(results_dir, args.manifest))
     section_quality(agg, out)
     section_validity(rows, agg, out)
