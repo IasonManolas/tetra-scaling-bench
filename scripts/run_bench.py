@@ -37,6 +37,7 @@ import csv
 import json
 import os
 import platform
+import re
 import shutil
 import signal
 import subprocess
@@ -360,11 +361,15 @@ def read_perf(path):
             value = float(parts[0].replace(",", "."))
         except ValueError:
             continue        # <not counted> / <not supported>
+        # On a hybrid CPU perf splits each hardware counter by core type, as
+        # `cpu_core/instructions/` and `cpu_atom/instructions/`. The process's
+        # count is their sum; matching only the bare name would read both as
+        # absent and make perf look unusable on exactly the 24-core machine.
         event = parts[2].strip()
-        if event == "instructions":
-            out["instructions"] = int(value)
-        elif event == "cycles":
-            out["cycles"] = int(value)
+        m = re.match(r"^(?:[\w-]+/)?(instructions|cycles)(?::\w+)?(?:/[\w,=]*)?$",
+                     event)
+        if m:
+            out[m.group(1)] = out.get(m.group(1), 0) + int(value)
         elif event == "task-clock":
             # perf reports task-clock in milliseconds.
             out["task_clock_ms"] = round(value, 3)
