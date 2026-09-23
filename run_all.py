@@ -120,6 +120,10 @@ def main():
     # workload each one is). Mesh_3, the expensive pipeline, goes to the biggest
     # CDTs only. Capping by surface file size is what made a 24-core run top out
     # at 26s when a surface outside the cap would have given 67s.
+    ap.add_argument("--allow-no-perf", action="store_true",
+                    help="run even if perf cannot count or sample (the "
+                         "instructions/cycles columns and the per-thread "
+                         "profile are then missing); by default it stops")
     ap.add_argument("--limit", type=int, default=0,
                     help="consider only the N largest surface FILES (0 = all)")
     ap.add_argument("--mesh3-limit", type=int, default=20,
@@ -203,6 +207,16 @@ def main():
     for tool in ("cmake", "git"):
         if shutil.which(tool) is None:
             problems.append("'%s' is not on PATH" % tool)
+    # perf is checked HERE, before the build and the 1-3 h of mesh
+    # preparation, not when measurement starts.
+    if not args.allow_no_perf:
+        sys.path.insert(0, str(SCRIPTS))
+        from run_bench import perf_check, PERF_FIXES
+        ok, why = perf_check()
+        if ok:
+            print("perf works: %s" % why)
+        else:
+            problems.append("perf does not work: %s.\n%s" % (why, PERF_FIXES))
     # Scale the disk estimate with how much is actually being built. A flat
     # figure blocks small runs for no reason: ~3 GB goes on the two CGAL clones
     # and their builds no matter what, and the rest tracks the number of
@@ -281,6 +295,8 @@ def main():
                "--profile", "metrics" if args.metrics else "full",
                "--budget", args.budget, "--threads-max", args.threads_max,
                "--reps", args.reps] + where
+    if args.allow_no_perf:
+        measure += ["--allow-no-perf"]
     if args.smoke:
         measure += ["--calib-budget", 360, "--max-configs", 2, "--run-timeout", 600]
     stage("3-measure", measure, log_dir, args.dry_run)

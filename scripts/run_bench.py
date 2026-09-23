@@ -297,45 +297,92 @@ def write_env(root, results_dir):
 _PERF = {}
 
 
-def perf_usable():
-    """Whether `perf stat` can actually count on this machine.
+PERF_FIXES = """\
+  How to fix it:
+    - `perf` not found, or "WARNING: perf not found for kernel ...": Ubuntu's
+      /usr/bin/perf is only a wrapper. Find a real binary with
+          find /usr/lib -name perf -type f
+      and put its folder first on the PATH, e.g.
+          export PATH=/usr/lib/linux-hwe-6.17-tools-6.17.0-42:$PATH
+    - "Access to performance monitoring ... is limited":
+          sudo sysctl -w kernel.perf_event_paranoid=1
+      (this resets on reboot).
+    - Check by hand:  perf stat -e instructions true
+  To run without perf anyway, pass --allow-no-perf: the instructions/cycles
+  columns stay empty and the per-thread profile is skipped."""
 
-    Probed once, by counting a trivial command, because the two ways it fails
-    are different: perf may not be installed at all, or it may be installed and
-    refused by kernel.perf_event_paranoid. Either way the run must still happen
-    -- a missing counter is a missing column, not a reason to lose 45 minutes of
-    machine time -- so this returns a verdict rather than exiting.
+
+def _first_message(text):
+    """perf's first informative line: its errors open with a bare "Error:"."""
+    for line in (text or "").splitlines():
+        line = line.strip()
+        if len(line) > 12 and not line.lower().startswith("error:"):
+            return line.rstrip(".")
+    return ""
+
+
+def perf_check():
+    """Whether perf can both COUNT and SAMPLE here, and if not, why.
+
+    Two probes, because the kit needs both and they fail separately: `perf
+    stat` for the instructions/cycles columns, `perf record` + `perf script`
+    for the per-thread profile. Returns (ok, reason); the reason is one line.
     """
+    import tempfile
+    if shutil.which("perf") is None:
+        return False, "`perf` is not on PATH"
+    para = ""
+    try:
+        para = Path("/proc/sys/kernel/perf_event_paranoid").read_text().strip()
+    except Exception:
+        pass
+    with tempfile.TemporaryDirectory() as d:
+        stat_out = Path(d) / "stat.perf"
+        try:
+            r = subprocess.run(["perf", "stat", "-e", PERF_EVENTS, "-x", PERF_SEP,
+                                "-o", str(stat_out), "true"],
+                               capture_output=True, text=True, timeout=60)
+        except Exception as e:
+            return False, "`perf stat` could not run (%s)" % e
+        if read_perf(stat_out).get("instructions") is None:
+            first = _first_message(r.stderr or r.stdout)
+            return False, ("`perf stat` counted no instructions "
+                           "(perf_event_paranoid=%s)%s"
+                           % (para or "unknown",
+                              (": " + first) if first else ""))
+        # A short busy loop in this very interpreter, so there is something
+        # to sample; `true` ends before the first sample.
+        data = Path(d) / "rec.data"
+        busy = [sys.executable, "-c", "sum(i*i for i in range(3000000))"]
+        try:
+            r = subprocess.run(["perf", "record", "-F", "999", "-q", "-o",
+                                str(data), "--"] + busy,
+                               capture_output=True, text=True, timeout=120)
+            s = subprocess.run(["perf", "script", "-i", str(data), "-F",
+                                "tid,time,ip,sym,dso"],
+                               capture_output=True, text=True, timeout=120)
+        except Exception as e:
+            return False, "`perf record` could not run (%s)" % e
+        if r.returncode != 0 or not s.stdout.strip():
+            first = _first_message(r.stderr)
+            return False, ("`perf record` took no samples (perf_event_paranoid=%s)%s"
+                           % (para or "unknown",
+                              (": " + first) if first else ""))
+    return True, "counting %s and sampling" % PERF_EVENTS
+
+
+def perf_usable():
+    """perf_check(), probed once per process, with its verdict printed."""
     if "ok" in _PERF:
         return _PERF["ok"]
-    _PERF["ok"] = False
-    if shutil.which("perf") is None:
-        print("[perf] not on PATH; instructions/cycles/task_clock_ms will be "
-              "empty. Install linux-tools to get them.", file=sys.stderr)
-        return False
-    import tempfile
-    with tempfile.NamedTemporaryFile(suffix=".perf") as tf:
-        try:
-            subprocess.run(["perf", "stat", "-e", PERF_EVENTS, "-x", PERF_SEP,
-                            "-o", tf.name, "true"],
-                           capture_output=True, timeout=60)
-            counted = read_perf(Path(tf.name))
-        except Exception:
-            counted = {}
-    if counted.get("instructions") is None:
-        para = ""
-        try:
-            para = Path("/proc/sys/kernel/perf_event_paranoid").read_text().strip()
-        except Exception:
-            pass
-        print("[perf] present but cannot count (perf_event_paranoid=%s). The "
-              "instructions/cycles/task_clock_ms columns will be empty.\n"
-              "       To enable it:  sudo sysctl -w kernel.perf_event_paranoid=1"
-              % (para or "unknown"), file=sys.stderr)
-        return False
-    _PERF["ok"] = True
-    print("[perf] counting %s" % PERF_EVENTS)
-    return True
+    ok, why = perf_check()
+    _PERF["ok"] = ok
+    if ok:
+        print("[perf] %s" % why)
+    else:
+        print("[perf] NOT USABLE: %s. The instructions/cycles columns will be "
+              "empty and the per-thread profile skipped." % why, file=sys.stderr)
+    return ok
 
 
 def read_perf(path):
@@ -1950,12 +1997,22 @@ def main():
                          "differ from the ones they were measured with (the "
                          "results set then mixes code versions); without it "
                          "the old results are replaced")
+    ap.add_argument("--allow-no-perf", action="store_true",
+                    help="measure even if perf cannot count or sample; by "
+                         "default the run stops before measuring anything")
     ap.add_argument("--settle", type=float, default=2.0,
                     help="seconds to idle before each run")
     args = ap.parse_args()
 
     if not args.profile and not args.quality_pass:
         ap.error("pass --profile or --quality-pass")
+
+    # Stop before measuring rather than come back with empty counter columns
+    # and no per-thread profile -- which is what two basquiat runs did.
+    if args.profile and not args.allow_no_perf and not perf_usable():
+        sys.exit("\nStopping: perf does not work on this machine, and without "
+                 "it the run\ncomes back without the data it exists for.\n\n"
+                 + PERF_FIXES)
 
     root = Path(args.root).resolve()
     tc_path = root / "toolchain.json"

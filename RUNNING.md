@@ -95,6 +95,16 @@ When the lock sees different code, it deletes the previous results and output
 meshes and starts that run over, so after a `git pull` you simply re-run the
 same command.
 
+### perf
+
+The run checks `perf` before anything else -- before the build and the mesh
+preparation -- by counting instructions and taking a few samples. If either
+fails it stops and prints the fix; the two usual ones are a `perf` wrapper
+that finds no binary for your kernel (put a real one first on the PATH) and
+`kernel.perf_event_paranoid` above 1 (`sudo sysctl -w kernel.perf_event_paranoid=1`,
+which resets on reboot). `--allow-no-perf` runs anyway, without the
+instruction counts and the per-thread profile.
+
 ### TBB
 
 TBB is the one dependency this branch adds. Without it the parallel arm does
