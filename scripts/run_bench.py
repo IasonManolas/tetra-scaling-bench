@@ -68,13 +68,16 @@ THREAD_LIST = [1, 2, 4, 8, 12, 16, 24]
 # the configurations the earlier ladder used, with cycles and instructions added,
 # so the two datasets are comparable. Everything else the smoke runs measured
 # answers a different question and is deliberately left out.
-METRICS_LADDER_CONFIGS = [("94665_cdt", 0.3), ("67856_cdt", 0.25),
-                          ("94665_mesh3", 0.25)]
+# 94665_mesh3 f0.25 was dropped after the 2026-09-23 basquiat run: at its
+# intended size (881 330 input cells) it took 114 of that run's 161 minutes,
+# scaled like 67856_cdt (5.99x against 6.46x at 24 threads), and neither sweep
+# moved it. Pass --metrics-phases to run what was removed.
+METRICS_LADDER_CONFIGS = [("94665_cdt", 0.3), ("67856_cdt", 0.25)]
 METRICS_REPS = 3
 METRICS_PIN_CONFIG = ("94665_cdt", 0.3)
 METRICS_PIN_THREADS = 8
 METRICS_LOCK_GRIDS = [16, 24, 32, 48, 64]
-METRICS_LOCK_CONFIGS = [("94665_cdt", 0.3), ("94665_mesh3", 0.25)]
+METRICS_LOCK_CONFIGS = [("94665_cdt", 0.3)]
 METRICS_DIAG_CONFIG = ("94665_cdt", 0.3)
 METRICS_DIAG_THREADS = [1, 24]
 LOCK_GRID_ENV = "CGAL_TETRAHEDRAL_REMESHING_LOCK_GRID"
@@ -1672,9 +1675,9 @@ def profile_metrics(sweep, bins, meshes, args, root, mesh_out_dir):
     """The scaling questions, and nothing else (docs/METRICS_REQUEST.md).
 
     About 45 minutes on a 24-core machine, against the 12 hours the full sweep
-    takes, because it runs only what a scaling analysis reads: three thread
-    ladders, a core-pinning comparison, a lock-grid sweep and two instrumented
-    runs. No edge-factor ladder, no extra meshes, and no `seq` or `main`
+    takes, because it runs only what a scaling analysis reads: two thread
+    ladders, two instrumented runs, a spatial-sort interval sweep and a
+    lock-grid sweep. No edge-factor ladder, no extra meshes, and no `seq` or `main`
     reference arms -- those run at one thread by definition and so cannot move
     with anything measured here.
     """
@@ -1833,8 +1836,13 @@ def main():
                          "docs/METRICS_REQUEST.md -- about 45 min, and it does not "
                          "calibrate, since its configurations are fixed")
     ap.add_argument("--metrics-phases",
-                    default="ladder,pinning,lockgrid,deferred,ssort,diagnostics",
-                    help="which parts of --profile metrics to run, in order")
+                    # pinning and deferred are settled by the 2026-09-23 run
+                    # (the scheduler already picks the performance cores; the
+                    # cutoff moved nothing) and are off by default. The lock
+                    # grid goes last, so a budget cut costs the optional part.
+                    default="ladder,diagnostics,ssort,lockgrid",
+                    help="which parts of --profile metrics to run, in order "
+                         "(also known: pinning, deferred)")
     ap.add_argument("--calib-budget", type=float, default=2400.0,
                     help="seconds of the full-profile budget given to calibration")
     ap.add_argument("--quality-pass", action="store_true",
@@ -1895,9 +1903,9 @@ def main():
 
     if args.budget is None:
         args.budget = {"calibrate": 1800.0, "full": 12 * 3600.0,
-                       # Generous against the ~45 min the work takes, so a slow
-                       # machine finishes rather than being cut off mid-ladder.
-                       "metrics": 3 * 3600.0}.get(args.profile, 0.0)
+                       # A cap, not the expected time: the work is ~45 min,
+                       # and the guard stops starting runs 20 min before this.
+                       "metrics": 90 * 60.0}.get(args.profile, 0.0)
     if args.run_timeout is None:
         # 240s was too tight: on a 24-core run the very first ladder probe hit
         # it, and every single-threaded anchor did too, so calibration learned

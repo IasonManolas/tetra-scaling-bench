@@ -27,7 +27,7 @@ There are three runs in the kit, and they are separate things:
 |---|---|---|
 | **smoke** | proves the kit works on your machine before you commit it to the long one | 30–45 min |
 | **full sweep** | the whole dataset: scaling and mesh quality, across many meshes and edge sizes | ~14 h |
-| **metrics** | the scaling measurements only — thread ladders, core pinning, the lock grid, two instrumented runs | ~45 min |
+| **metrics** | the scaling measurements only — two thread ladders, two instrumented runs, two setting sweeps | ~45 min |
 
 The metrics run is the one we are asking for now. It writes to its own
 directory, so it cannot disturb a full sweep you have already done.
@@ -196,23 +196,22 @@ nohup python3 run_all.py \
     --metrics > metrics.log 2>&1 &
 ```
 
-It builds, prepares inputs if they are not already there, and then measures
-four things:
+It builds, prepares inputs if they are not already there, and then measures,
+in this order:
 
-- **three thread ladders** at 1, 2, 4, 8, 12, 16 and 24 threads, three
-  repetitions each — how the run time falls as threads are added, and how much
-  work is executed at each point.
-- **core pinning**: the same configuration at 8 threads, run unpinned, then
-  pinned to the 8 fastest cores, then to 8 of the slowest. Your CPU has two
-  kinds of core, and this says whether landing on the slow ones is part of what
-  we are seeing. The two sets are identified from the cores' own maximum
-  clocks at run time, so nothing is hardcoded to your machine.
-- **a lock-grid sweep** over 16, 24, 32, 48 and 64 at 24 threads — the
-  remesher's locking granularity was chosen on a 4-core machine, and this says
-  whether that choice still holds on yours.
+- **two thread ladders** (`94665_cdt` f0.3 and `67856_cdt` f0.25) at 1, 2, 4,
+  8, 12, 16 and 24 threads, three repetitions each — how the run time falls as
+  threads are added, and how much work is executed at each point.
 - **two instrumented runs**, one printing a line per stage of the remesher and
   one printing lock-retry counts. These are diagnostics; their stdout is what
   we want, not their timing.
+- **a spatial-sort interval sweep** over 1, 2, 3 and 4 at 24 threads on
+  `94665_cdt` f0.3.
+- **a lock-grid sweep** over 16, 24, 32, 48 and 64 at 24 threads on the same
+  configuration.
+
+Core pinning, the deferred-cutoff sweep and `94665_mesh3` were answered by the
+2026-09-23 run and are no longer run by default.
 
 > **If the input meshes are not already prepared**, the preparation stage runs
 > first and takes 1–3 hours. It does not need the machine idle, and it only
@@ -228,7 +227,7 @@ python3 scripts/run_bench.py --root ~/tetra-bench-work --profile metrics \
     --mesh-out-dir ~/tetra-bench-work/metrics_out_meshes
 ```
 
-The phase names are `ladder`, `pinning`, `lockgrid` and `diagnostics`.
+The phase names are `ladder`, `diagnostics`, `ssort` and `lockgrid` (the default), plus `pinning` and `deferred`.
 
 ### The smoke run (~30–45 min)
 
@@ -261,17 +260,18 @@ quality. Only the measuring needs the machine idle.
 |---|---|---|
 | build | ~15 min (~25 with the metrics run's two extra binaries) | no |
 | prepare inputs | 1–3 h, once ever | no |
-| metrics: three thread ladders | ~25 min | **yes** |
-| metrics: lock-grid sweep | ~9 min | **yes** |
-| metrics: core pinning | ~5 min | **yes** |
-| metrics: instrumented runs | ~3 min | **yes** |
+| metrics: two thread ladders | ~32 min | **yes** |
+| metrics: instrumented runs | ~4 min | **yes** |
+| metrics: spatial-sort interval sweep | ~5 min | **yes** |
+| metrics: lock-grid sweep | ~6 min | **yes** |
 | full sweep: measurement | 12 h | **yes** |
 | quality pass | 5 min–1 h | no |
 
 So the metrics run needs about **45 minutes** of an otherwise idle machine, and
 the stages either side of that do not care what else is running.
 
-These estimates come from your own earlier smoke runs, so they should be close.
+These estimates come from the 2026-09-23 basquiat run, so they should be close.
+The run stops starting new measurements after about 70 minutes whatever happens.
 A run that takes noticeably longer is worth mentioning to us.
 
 ---

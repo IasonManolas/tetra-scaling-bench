@@ -135,9 +135,9 @@ def main():
                          "prepared meshes it produces are reused by the real run.")
     ap.add_argument("--metrics", action="store_true",
                     help="the scaling-only run (~45 min) instead of the 12-hour "
-                         "sweep: three thread ladders with cycles and instructions, "
-                         "a core-pinning comparison, a lock-grid sweep and two "
-                         "instrumented runs. Written to separate metrics_* "
+                         "sweep: two thread ladders with cycles and instructions, "
+                         "two instrumented runs, a spatial-sort interval sweep "
+                         "and a lock-grid sweep. Written to separate metrics_* "
                          "directories, like --smoke, so it cannot contaminate the "
                          "real results. It also builds the two diagnostic binaries.")
     ap.add_argument("--skip-quality", action="store_true",
@@ -163,7 +163,7 @@ def main():
     # of these cells would mix two different measurements into one dataset.
     if args.metrics:
         if args.budget == 12 * 3600:
-            args.budget = 3 * 3600
+            args.budget = 90 * 60     # a cap; the work is ~45 min
         args.reps = 3
         results_dir = root / "metrics_results"
         mesh_out_dir = root / "metrics_out_meshes"

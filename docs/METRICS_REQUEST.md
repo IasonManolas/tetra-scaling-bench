@@ -3,6 +3,12 @@
 Written 2026-09-22 against `bd32d445baa`. Everything below is a measurement
 request, not a code change. The two code changes are in `~/wt_scale24`.
 
+> **Trimmed 2026-09-23.** The basquiat run of that day settled three items, and
+> the kit no longer runs them by default: `94665_mesh3` (§2, §6) scaled like
+> `67856_cdt` and took 114 of 161 minutes at its intended size; core pinning
+> (§3) showed the scheduler already picks the performance cores; the
+> deferred-cutoff sweep moved nothing. What remains runs in about 45 minutes.
+
 ## Why these
 
 The returned data already settles the top-level split, on `94665_cdt` at edge
