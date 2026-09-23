@@ -95,6 +95,15 @@ When the lock sees different code, it deletes the previous results and output
 meshes and starts that run over, so after a `git pull` you simply re-run the
 same command.
 
+### Previous results
+
+A metrics or smoke run deletes the previous run's `metrics_results/` and
+`metrics_out_meshes/` (or the `smoke_` ones) before it starts, so every run is
+clean. Prepared meshes, builds and earlier result tarballs are kept. Pass
+`--keep-previous` to keep them and resume instead -- only useful after an
+interrupted run, since finished runs are then reused as they are. The full
+sweep always resumes.
+
 ### perf
 
 The run checks `perf` before anything else -- before the build and the mesh

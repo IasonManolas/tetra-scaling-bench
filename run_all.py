@@ -120,6 +120,12 @@ def main():
     # workload each one is). Mesh_3, the expensive pipeline, goes to the biggest
     # CDTs only. Capping by surface file size is what made a 24-core run top out
     # at 26s when a surface outside the cap would have given 67s.
+    ap.add_argument("--keep-previous", action="store_true",
+                    help="--metrics/--smoke: keep the previous run's results and "
+                         "output meshes and resume on top of them (finished "
+                         "runs are reused). By default they are deleted first, "
+                         "so every run starts clean. The full sweep always "
+                         "resumes.")
     ap.add_argument("--allow-no-perf", action="store_true",
                     help="run even if perf cannot count or sample (the "
                          "instructions/cycles columns and the per-thread "
@@ -250,6 +256,21 @@ def main():
             sys.exit(1)
 
     root.mkdir(parents=True, exist_ok=True)
+
+    # A metrics or smoke run starts clean unless asked otherwise: resuming
+    # reuses every finished run, so a re-run after fixing perf would come back
+    # with the OLD runs and their empty counter columns. Only this run's own
+    # two directories go; prepared meshes, builds and earlier tarballs stay.
+    # The full sweep is exempt -- resuming a 12-hour run is the point there.
+    if (args.metrics or args.smoke) and not args.keep_previous:
+        for d in (results_dir, mesh_out_dir):
+            if d.exists():
+                if args.dry_run:
+                    print("(dry run: would delete %s)" % d)
+                else:
+                    shutil.rmtree(d)
+                    print("Deleted the previous %s (pass --keep-previous to "
+                          "keep it)." % d.name)
     log_dir = root / "logs_run_all"
     log_dir.mkdir(parents=True, exist_ok=True)
 
