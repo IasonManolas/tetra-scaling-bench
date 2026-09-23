@@ -205,6 +205,11 @@ in this order:
 - **two instrumented runs**, one printing a line per stage of the remesher and
   one printing lock-retry counts. These are diagnostics; their stdout is what
   we want, not their timing.
+- **a per-thread profile** of both ladder meshes at 24 threads: `perf record`,
+  then `scripts/serial_profile.py`, which lists the functions running while
+  the other threads had nothing to do. Only the summary is kept, in
+  `serialprof/`; the raw recording is deleted. Needs `perf`, and is skipped
+  without it.
 - **a spatial-sort interval sweep** over 1, 2, 3 and 4 at 24 threads on
   `94665_cdt` f0.3.
 - **a lock-grid sweep** over 16, 24, 32, 48 and 64 at 24 threads on the same
@@ -227,7 +232,7 @@ python3 scripts/run_bench.py --root ~/tetra-bench-work --profile metrics \
     --mesh-out-dir ~/tetra-bench-work/metrics_out_meshes
 ```
 
-The phase names are `ladder`, `diagnostics`, `ssort` and `lockgrid` (the default), plus `pinning` and `deferred`.
+The phase names are `ladder`, `diagnostics`, `serialprof`, `ssort` and `lockgrid` (the default), plus `pinning` and `deferred`.
 
 ### The smoke run (~30–45 min)
 
@@ -262,6 +267,7 @@ quality. Only the measuring needs the machine idle.
 | prepare inputs | 1–3 h, once ever | no |
 | metrics: two thread ladders | ~32 min | **yes** |
 | metrics: instrumented runs | ~4 min | **yes** |
+| metrics: per-thread profile | ~2 min | **yes** |
 | metrics: spatial-sort interval sweep | ~5 min | **yes** |
 | metrics: lock-grid sweep | ~6 min | **yes** |
 | full sweep: measurement | 12 h | **yes** |

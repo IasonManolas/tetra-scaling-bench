@@ -136,7 +136,7 @@ def main():
     ap.add_argument("--metrics", action="store_true",
                     help="the scaling-only run (~45 min) instead of the 12-hour "
                          "sweep: two thread ladders with cycles and instructions, "
-                         "two instrumented runs, a spatial-sort interval sweep "
+                         "two instrumented runs, a per-thread profile, a spatial-sort interval sweep "
                          "and a lock-grid sweep. Written to separate metrics_* "
                          "directories, like --smoke, so it cannot contaminate the "
                          "real results. It also builds the two diagnostic binaries.")

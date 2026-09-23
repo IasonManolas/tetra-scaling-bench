@@ -1671,6 +1671,78 @@ def metrics_diagnostics(sweep, bins, meshes, args, common, results_dir):
     print("  stdout captures and exit statuses in %s" % diag_dir)
 
 
+METRICS_SERIALPROF_CONFIGS = [("94665_cdt", 0.3), ("67856_cdt", 0.25)]
+SERIALPROF_FREQ = 999
+
+
+def metrics_serialprof(sweep, bins, meshes, args, results_dir):
+    """A per-thread sampling profile at the widest thread count.
+
+    The stage timers say which stage does not speed up; this names the
+    functions. scripts/serial_profile.py finds the time slices in which at most
+    one thread was running remeshing code and lists what that thread was
+    running. Only its summary comes back -- the raw perf.data is tens of MB and
+    is deleted once read. A diagnostic, not a timing: the run is sampled, so its
+    wall time is not comparable with the ladder's.
+    """
+    if not perf_usable():
+        print("\n=== per-thread profile: skipped, perf cannot count on this "
+              "machine (see the [perf] line above) ===", file=sys.stderr)
+        return
+    configs = _metrics_lookup(meshes, METRICS_SERIALPROF_CONFIGS)
+    if not configs:
+        return
+    t = args.threads_max
+    out_dir = results_dir / "serialprof"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    analyser = Path(__file__).resolve().parent / "serial_profile.py"
+    print("\n=== per-thread profile at %d threads ===" % t)
+    for mesh, factor in configs:
+        stem = cell_stem(mesh["key"], factor, "par", t, 1, "serialprof")
+        summary = out_dir / (stem + ".txt")
+        if summary.exists():
+            print("  %-26s (cached)" % mesh["key"])
+            continue
+        if sweep.left() < args.run_timeout:
+            print("  budget spent, stopping")
+            return
+        perf_data = out_dir / (stem + ".perf.data")
+        json_path = out_dir / (stem + ".run.json")
+        cmd = ["perf", "record", "-F", str(SERIALPROF_FREQ), "-q",
+               "-o", str(perf_data), "--",
+               str(bins["bench_remesh"]), str(mesh["path"]), str(ITERS),
+               str(factor), str(SMOOTH_CONSTRAINED), str(t), str(json_path),
+               "--tag", "par"]
+        if args.settle:
+            time.sleep(args.settle)
+        t0 = time.time()
+        try:
+            rc = subprocess.run(cmd, stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL,
+                                timeout=args.run_timeout).returncode
+        except subprocess.TimeoutExpired:
+            rc = "timeout"
+        wall = time.time() - t0
+        if rc != 0 or not perf_data.exists():
+            print("  WARNING: %s: perf record exited %s; no profile."
+                  % (mesh["key"], rc), file=sys.stderr)
+            perf_data.unlink(missing_ok=True)
+            continue
+        a = subprocess.run([sys.executable, str(analyser), str(perf_data),
+                            "--freq", str(SERIALPROF_FREQ),
+                            "--out", str(summary),
+                            "--json", str(out_dir / (stem + ".json"))],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                           text=True)
+        perf_data.unlink(missing_ok=True)
+        if a.returncode != 0:
+            print("  WARNING: %s: the analysis failed: %s"
+                  % (mesh["key"], a.stderr.strip()[-300:]), file=sys.stderr)
+            continue
+        print("  %-26s t=%-3d %8.1fs  profile in %s"
+              % (mesh["key"], t, wall, summary.name), flush=True)
+
+
 def profile_metrics(sweep, bins, meshes, args, root, mesh_out_dir):
     """The scaling questions, and nothing else (docs/METRICS_REQUEST.md).
 
@@ -1689,7 +1761,9 @@ def profile_metrics(sweep, bins, meshes, args, root, mesh_out_dir):
               "deferred": lambda: metrics_deferred(sweep, bins, meshes, args, common),
               "ssort": lambda: metrics_ssort_every(sweep, bins, meshes, args, common),
               "diagnostics": lambda: metrics_diagnostics(sweep, bins, meshes, args,
-                                                         common, sweep.results_dir)}
+                                                         common, sweep.results_dir),
+              "serialprof": lambda: metrics_serialprof(sweep, bins, meshes, args,
+                                                       sweep.results_dir)}
     wanted = [x.strip() for x in args.metrics_phases.split(",") if x.strip()]
     unknown = [x for x in wanted if x not in phases]
     if unknown:
@@ -1721,7 +1795,7 @@ def package(results_dir, root, mesh_out_dir=None):
               "toolchain_lock.json", "json", "quality",
               # the metrics profile's artefacts: the raw perf counter files and
               # the instrumented runs' stdout, which is the whole point of them
-              "perf", "diagnostics"]
+              "perf", "diagnostics", "serialprof"]
     try:
         with tarfile.open(out, "w:gz") as tf:
             for name in wanted:
@@ -1840,7 +1914,7 @@ def main():
                     # (the scheduler already picks the performance cores; the
                     # cutoff moved nothing) and are off by default. The lock
                     # grid goes last, so a budget cut costs the optional part.
-                    default="ladder,diagnostics,ssort,lockgrid",
+                    default="ladder,diagnostics,serialprof,ssort,lockgrid",
                     help="which parts of --profile metrics to run, in order "
                          "(also known: pinning, deferred)")
     ap.add_argument("--calib-budget", type=float, default=2400.0,

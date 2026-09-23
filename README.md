@@ -212,8 +212,8 @@ nohup python3 run_all.py --surfaces-dir /path/to/thingi10k --metrics > metrics.l
 
 The scaling questions and nothing else, specified in
 [docs/METRICS_REQUEST.md](docs/METRICS_REQUEST.md): two thread ladders with
-instructions and cycles recorded, two instrumented runs, a spatial-sort
-interval sweep and a lock-grid sweep. It skips everything the full sweep measures that a
+instructions and cycles recorded, two instrumented runs, a per-thread profile
+of the serial functions, a spatial-sort interval sweep and a lock-grid sweep. It skips everything the full sweep measures that a
 scaling analysis does not read — the edge-factor ladder, the extra meshes, and
 the `seq` and `main` reference arms, which run at one thread by definition and
 so cannot move with anything tested here.
